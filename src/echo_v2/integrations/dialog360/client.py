@@ -1,0 +1,408 @@
+"""Raw async HTTP client for 360dialog / WhatsApp Cloud API.
+
+This is the only module that knows 360dialog URL shapes and embeds the
+D360 API key. It sends messages **from the Echo Business Bot** to users.
+The bot is a single shared number — there is no per-user instance.
+
+Error classification follows the same taxonomy as :class:`GreenClient`:
+* 5xx / timeout on a send → :class:`IndeterminateError` (message may have
+  been delivered; never blindly retry).
+* 4xx (non-429) → :class:`PermanentError`.
+* 429 / connect error → :class:`RetryableError`.
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import httpx
+from langsmith import traceable
+
+from echo_v2.integrations.dialog360.settings import Dialog360Settings
+from echo_v2.runtime.errors import (
+    IndeterminateError,
+    PermanentError,
+    RetryableError,
+)
+
+__all__ = ["Dialog360Client"]
+
+_logger = logging.getLogger("echo_v2.dialog360.client")
+
+
+class Dialog360Client:
+    """HTTP client for the 360dialog WhatsApp Business API."""
+
+    def __init__(
+        self,
+        settings: Dialog360Settings,
+        http_client: httpx.AsyncClient | None = None,
+    ) -> None:
+        self._settings = settings
+        self._owns_client = http_client is None
+        self._client = http_client or httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+        )
+
+    async def aclose(self) -> None:
+        if self._owns_client:
+            await self._client.aclose()
+
+    async def send_text(self, recipient: str, text: str) -> str:
+        """Send a text message from the bot to ``recipient``.
+
+        ``recipient`` is a phone number (E.164 or raw). Returns the
+        message ID assigned by 360dialog. A timeout or 5xx is
+        :class:`IndeterminateError` — the message may have been sent.
+        """
+        phone = _normalize_phone(recipient)
+        payload: dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": phone,
+            "type": "text",
+            "text": {"body": text},
+        }
+        data = await self._post_json(
+            f"{self._settings.api_base_url}/messages",
+            payload,
+            operation="send_text",
+        )
+        msg_id = data.get("message_id") if isinstance(data, dict) else None
+        if not msg_id:
+            # 360dialog may return messages[0].id on some API versions.
+            messages = data.get("messages") if isinstance(data, dict) else None
+            if isinstance(messages, list) and messages:
+                msg_id = messages[0].get("id")
+        if not msg_id:
+            raise PermanentError("360dialog send_text response missing message id")
+        return str(msg_id)
+
+    async def send_template(
+        self,
+        recipient: str,
+        template_name: str,
+        language: str,
+        body_params: list[str],
+        *,
+        url_suffix: str | None = None,
+    ) -> str:
+        """Send a template message from the bot to ``recipient``.
+
+        Args:
+            recipient: Phone number (E.164 or raw).
+            template_name: The approved template name (e.g.
+                ``morning_waiting_digest``).
+            language: The language code (e.g. ``he``).
+            body_params: Body parameter values, in order ({{1}}, {{2}}, ...).
+            url_suffix: Optional dynamic value for a URL button's
+                variable. The template must be approved with a URL
+                button containing ``{{1}}``. When provided, a button
+                component is added to the payload.
+
+        Returns the message ID assigned by 360dialog.
+        """
+        phone = _normalize_phone(recipient)
+        components: list[dict[str, Any]] = [
+            {
+                "type": "body",
+                "parameters": [
+                    {"type": "text", "text": param}
+                    for param in body_params
+                ],
+            }
+        ]
+        if url_suffix is not None:
+            components.append(
+                {
+                    "type": "button",
+                    "sub_type": "url",
+                    "index": 0,
+                    "parameters": [{"type": "text", "text": url_suffix}],
+                }
+            )
+        payload: dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": phone,
+            "type": "template",
+            "template": {
+                "name": template_name,
+                "language": {"code": language},
+                "components": components,
+            },
+        }
+        data = await self._post_json(
+            f"{self._settings.api_base_url}/messages",
+            payload,
+            operation="send_template",
+        )
+        return _extract_msg_id(data, "send_template")
+
+    async def send_interactive_list(
+        self,
+        recipient: str,
+        *,
+        body_text: str,
+        button_text: str,
+        sections: list[dict[str, Any]],
+    ) -> str:
+        """Send an interactive list message.
+
+        Args:
+            recipient: Phone number (E.164 or raw).
+            body_text: The message body text (above the list button).
+            button_text: The text on the list button (max 20 chars).
+            sections: A list of section dicts, each with ``title`` and
+                ``rows``. Each row is a dict with ``id``, ``title``, and
+                optional ``description``. Max 10 rows total.
+
+        Returns the message ID assigned by 360dialog.
+        """
+        phone = _normalize_phone(recipient)
+        payload: dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": phone,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "body": {"text": body_text},
+                "action": {
+                    "button": button_text,
+                    "sections": sections,
+                },
+            },
+        }
+        data = await self._post_json(
+            f"{self._settings.api_base_url}/messages",
+            payload,
+            operation="send_interactive_list",
+        )
+        return _extract_msg_id(data, "send_interactive_list")
+
+    async def send_buttons(
+        self,
+        recipient: str,
+        *,
+        body_text: str,
+        buttons: list[dict[str, str]],
+    ) -> str:
+        """Send an interactive button message.
+
+        Args:
+            recipient: Phone number (E.164 or raw).
+            body_text: The message body text (above the buttons).
+            buttons: A list of button dicts, each with ``id`` and ``title``.
+                Max 3 buttons.
+
+        Returns the message ID assigned by 360dialog.
+        """
+        phone = _normalize_phone(recipient)
+        payload: dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": phone,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": body_text},
+                "action": {
+                    "buttons": [
+                        {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
+                        for b in buttons
+                    ]
+                },
+            },
+        }
+        data = await self._post_json(
+            f"{self._settings.api_base_url}/messages",
+            payload,
+            operation="send_buttons",
+        )
+        return _extract_msg_id(data, "send_buttons")
+
+    async def send_image(
+        self,
+        recipient: str,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        caption: str | None = None,
+    ) -> str:
+        """Send an image message by uploading it to 360dialog first.
+
+        Uploads the raw image bytes to the 360dialog ``/media`` endpoint,
+        then sends an ``image`` message referencing the returned media ID.
+        A timeout or 5xx on either call is :class:`IndeterminateError` —
+        the upload may have succeeded (media may be stored) so the caller
+        must not blindly retry.
+
+        Args:
+            recipient: Phone number (E.164 or raw).
+            image_bytes: Raw image bytes to upload and send.
+            mime_type: MIME type of the image (e.g. ``image/png``).
+            caption: Optional caption shown below the image.
+
+        Returns the message ID assigned by 360dialog.
+        """
+        media_id = await self._upload_media(image_bytes, mime_type)
+        phone = _normalize_phone(recipient)
+        image: dict[str, Any] = {"id": media_id}
+        if caption:
+            image["caption"] = caption
+        payload: dict[str, Any] = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": phone,
+            "type": "image",
+            "image": image,
+        }
+        data = await self._post_json(
+            f"{self._settings.api_base_url}/messages",
+            payload,
+            operation="send_image",
+        )
+        return _extract_msg_id(data, "send_image")
+
+    async def _upload_media(
+        self,
+        image_bytes: bytes,
+        mime_type: str,
+    ) -> str:
+        """Upload media to 360dialog and return the media ID.
+
+        Uses ``multipart/form-data`` with ``messaging_product=whatsapp`` and
+        a ``file`` field. The filename is derived from the MIME type.
+        """
+        url = f"{self._settings.api_base_url}/media"
+        ext = _mime_extension(mime_type)
+        files: list[tuple[str, tuple[str | None, bytes, str | None]]] = [
+            ("messaging_product", (None, b"whatsapp", None)),
+            ("file", (f"upload.{ext}", image_bytes, mime_type)),
+        ]
+        headers = {"D360-API-KEY": self._settings.api_key}
+        try:
+            response = await self._client.post(url, files=files, headers=headers)
+        except httpx.ConnectError as exc:
+            _logger.info("provider=dialog360 operation=upload_media status=connect_error")
+            raise RetryableError("connect error during upload_media") from exc
+        except httpx.ReadTimeout as exc:
+            _logger.info("provider=dialog360 operation=upload_media status=read_timeout")
+            raise IndeterminateError("read timeout during upload_media") from exc
+        except httpx.HTTPError as exc:
+            _logger.info(
+                "provider=dialog360 operation=upload_media status=transport_error error_type=%s",
+                type(exc).__name__,
+            )
+            raise IndeterminateError(
+                f"transport error during upload_media: {type(exc).__name__}"
+            ) from exc
+
+        status = response.status_code
+        _logger.info(
+            "provider=dialog360 operation=upload_media status_code=%s", status,
+        )
+
+        if status == 429:
+            raise RetryableError("rate limited during upload_media")
+        if 500 <= status < 600:
+            raise IndeterminateError(f"dialog360 upload_media returned HTTP {status}")
+        if 400 <= status < 500:
+            raise PermanentError(f"dialog360 upload_media returned HTTP {status}")
+
+        body = _safe_json(response)
+        media_id = body.get("id") if isinstance(body, dict) else None
+        if not media_id:
+            raise PermanentError("360dialog upload_media response missing id")
+        return str(media_id)
+
+
+    @traceable(name="wfm.http.dialog360")
+    async def _post_json(
+        self,
+        url: str,
+        payload: dict[str, Any],
+        *,
+        operation: str,
+    ) -> dict[str, Any]:
+        headers = {
+            "D360-API-KEY": self._settings.api_key,
+            "Content-Type": "application/json",
+        }
+        try:
+            response = await self._client.post(url, json=payload, headers=headers)
+        except httpx.ConnectError as exc:
+            _logger.info("provider=dialog360 operation=%s status=connect_error", operation)
+            raise RetryableError(f"connect error during {operation}") from exc
+        except httpx.ReadTimeout as exc:
+            _logger.info("provider=dialog360 operation=%s status=read_timeout", operation)
+            raise IndeterminateError(f"read timeout during {operation}") from exc
+        except httpx.HTTPError as exc:
+            _logger.info(
+                "provider=dialog360 operation=%s status=transport_error error_type=%s",
+                operation,
+                type(exc).__name__,
+            )
+            raise IndeterminateError(
+                f"transport error during {operation}: {type(exc).__name__}"
+            ) from exc
+
+        status = response.status_code
+        _logger.info("provider=dialog360 operation=%s status_code=%s", operation, status)
+
+        if status == 429:
+            raise RetryableError(f"rate limited during {operation}")
+        if 500 <= status < 600:
+            raise IndeterminateError(f"dialog360 {operation} returned HTTP {status}")
+        if 400 <= status < 500:
+            raise PermanentError(f"dialog360 {operation} returned HTTP {status}")
+
+        body = _safe_json(response)
+        return body if isinstance(body, dict) else {}
+
+
+def _safe_json(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except ValueError:
+        return None
+
+
+def _extract_msg_id(data: dict[str, Any], operation: str) -> str:
+    """Extract the message ID from a 360dialog send response."""
+    msg_id = data.get("message_id") if isinstance(data, dict) else None
+    if not msg_id:
+        messages = data.get("messages") if isinstance(data, dict) else None
+        if isinstance(messages, list) and messages:
+            msg_id = messages[0].get("id")
+    if not msg_id:
+        raise PermanentError(f"360dialog {operation} response missing message id")
+    return str(msg_id)
+
+
+def _normalize_phone(recipient: str) -> str:
+    """Strip formatting to get a bare phone number for the API."""
+    return (
+        recipient
+        .replace("@c.us", "")
+        .replace("+", "")
+        .replace(" ", "")
+        .replace("-", "")
+        .strip()
+    )
+
+
+_MIME_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+
+
+def _mime_extension(mime_type: str) -> str:
+    """Return a file extension for a MIME type (defaults to ``bin``)."""
+    return _MIME_EXTENSIONS.get(mime_type.lower(), "bin")

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Exec(git log)",
+      "Exec(tail)",
+      "Exec(head)",
+      "Exec(break)",
+      "Exec(set)",
+      "Exec(sed)",
+      "Exec(psql)"
+    ]
+  }
+}

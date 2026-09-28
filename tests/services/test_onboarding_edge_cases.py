@@ -1,0 +1,1926 @@
+"""Edge-case tests for OnboardingService — targets uncovered branches.
+
+Covers error paths, idempotency skips, invalid inputs, polling fallbacks,
+and the ``failed`` retry path that the main test file does not exercise.
+
+Flow (simplified — name collected before provisioning):
+1. start_onboarding → create user (pending) + ask name
+2. handle_name_response → store name + send [חבר אותי] button
+3. handle_onboarding_connect → start_pairing (pool miss = background create)
+3. _poll_until_authorized → send OTP once, then complete to active
+4. handle_connection_established → status=active + welcome
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import secrets
+from dataclasses import dataclass, field
+
+import pytest
+
+from echo_v2.integrations.green.provisioner import GreenProvisioner
+from echo_v2.persistence.whatsapp_connections import (
+    InMemoryWhatsAppConnectionRepository,
+)
+from echo_v2.ports.bot import BotEvent, BotEventType
+from echo_v2.ports.whatsapp import ConnectionConfig, CreatedConnection
+from echo_v2.services.onboarding import OnboardingService
+
+__all__ = []
+
+PHONE = "+972546610653"
+
+
+# --- Fakes -----------------------------------------------------------------
+
+
+@dataclass
+class FakeBot:
+    """Records sent messages for assertion."""
+
+    sent: list[tuple[str, str]] = field(default_factory=list)
+    sent_buttons: list[tuple[str, str, list[dict]]] = field(default_factory=list)
+    sent_images: list[tuple[str, bytes, str | None]] = field(default_factory=list)
+    send_buttons_should_fail: bool = False
+    send_text_should_fail: bool = False
+    send_image_should_fail: bool = False
+
+    async def send_text(self, user_phone: str, text: str) -> None:
+        if self.send_text_should_fail:
+            raise RuntimeError("text boom")
+        self.sent.append((user_phone, text))
+
+    async def send_image(
+        self,
+        user_phone: str,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        caption: str | None = None,
+    ) -> str:
+        if self.send_image_should_fail:
+            raise RuntimeError("image boom")
+        self.sent_images.append((user_phone, image_bytes, caption))
+        return "fake-image-msg-id"
+
+    async def send_template(
+        self,
+        user_phone: str,
+        template_name: str,
+        language: str,
+        body_params: list[str],
+    ) -> str:
+        self.sent.append((user_phone, f"[template:{template_name}]"))
+        return "fake-msg-id"
+
+    async def send_buttons(
+        self,
+        user_phone: str,
+        *,
+        body_text: str,
+        buttons: list[dict],
+    ) -> str:
+        if self.send_buttons_should_fail:
+            raise RuntimeError("buttons boom")
+        self.sent_buttons.append((user_phone, body_text, buttons))
+        return "fake-msg-id"
+
+
+class FakeUserRepo:
+    """In-memory user repository with configurable failure modes."""
+
+    def __init__(self, *, allow_recreate: bool = False) -> None:
+        self._users: dict[str, dict] = {}
+        self._by_id: dict[str, str] = {}
+        self._allow_recreate = allow_recreate
+        self.create_should_fail = False
+
+    async def create_user(
+        self,
+        phone: str,
+        *,
+        timezone: str = "Asia/Jerusalem",
+        first_name: str | None = None,
+        onboarding_status: str = "pending",
+    ) -> str:
+        if self.create_should_fail:
+            raise RuntimeError("boom")
+        if phone in self._users and not self._allow_recreate:
+            raise ValueError(f"User with phone {phone} already exists")
+        user_id = secrets.token_hex(16)
+        self._users[phone] = {
+            "id": user_id,
+            "onboarding": onboarding_status,
+            "name": first_name,
+            "timezone": timezone,
+        }
+        self._by_id[user_id] = phone
+        return user_id
+
+    async def get_by_phone(
+        self, phone: str
+    ) -> tuple[str, str | None, str | None] | None:
+        user = self._users.get(phone)
+        if user is None:
+            return None
+        return (user["id"], user["onboarding"], user["name"])
+
+    async def update_onboarding_status(self, user_id: str, status: str) -> None:
+        phone = self._by_id.get(user_id)
+        if phone is None:
+            return
+        self._users[phone]["onboarding"] = status
+
+    async def update_first_name(self, user_id: str, first_name: str) -> None:
+        """Update first_name only — does NOT change onboarding_status."""
+        phone = self._by_id.get(user_id)
+        if phone is None:
+            return
+        self._users[phone]["name"] = first_name
+
+    async def get_phone_by_id(self, user_id: str) -> str | None:
+        return self._by_id.get(user_id)
+
+
+class FakeUserRepoNoPhoneLookup:
+    """User repo without ``get_phone_by_id`` — _lookup_phone returns None."""
+
+    def __init__(self) -> None:
+        self._users: dict[str, dict] = {}
+        self._by_id: dict[str, str] = {}
+
+    async def create_user(
+        self,
+        phone: str,
+        *,
+        timezone: str = "Asia/Jerusalem",
+        first_name: str | None = None,
+        onboarding_status: str = "pending",
+    ) -> str:
+        user_id = secrets.token_hex(16)
+        self._users[phone] = {
+            "id": user_id,
+            "onboarding": onboarding_status,
+            "name": first_name,
+            "timezone": timezone,
+        }
+        self._by_id[user_id] = phone
+        return user_id
+
+    async def get_by_phone(
+        self, phone: str
+    ) -> tuple[str, str | None, str | None] | None:
+        user = self._users.get(phone)
+        if user is None:
+            return None
+        return (user["id"], user["onboarding"], user["name"])
+
+    async def update_onboarding_status(self, user_id: str, status: str) -> None:
+        phone = self._by_id.get(user_id)
+        if phone is None:
+            return
+        self._users[phone]["onboarding"] = status
+
+    async def update_first_name(self, user_id: str, first_name: str) -> None:
+        """Update first_name only — does NOT change onboarding_status."""
+        phone = self._by_id.get(user_id)
+        if phone is None:
+            return
+        self._users[phone]["name"] = first_name
+
+
+class FakeGreenClient:
+    """Fake GreenClient with configurable state sequences and failures."""
+
+    def __init__(self, otp_code: str = "12345678") -> None:
+        self._otp_code = otp_code
+        self.otp_calls: list[tuple[str, str, int]] = []
+        self._state_sequence: list[str | None] = []
+        self.get_auth_should_fail = False
+        self.get_state_should_fail = False
+        self.qr_should_fail = False
+        self.qr_response: dict = {
+            "type": "qrCode",
+            "message": base64.b64encode(b"fake-qr-png").decode("utf-8"),
+        }
+
+    def set_state_sequence(self, states: list[str | None]) -> None:
+        self._state_sequence = list(states)
+
+    async def get_authorization_code(
+        self,
+        id_instance: str,
+        api_token: str,
+        phone_number: int,
+    ) -> str:
+        self.otp_calls.append((id_instance, api_token, phone_number))
+        if self.get_auth_should_fail:
+            raise RuntimeError("otp boom")
+        return self._otp_code
+
+    async def create_instance(self, payload: dict) -> dict:
+        return {
+            "idInstance": "fake-instance-123",
+            "apiTokenInstance": "fake-api-token-456",
+        }
+
+    async def set_settings(
+        self,
+        id_instance: str,
+        api_token: str,
+        settings: dict,
+    ) -> None:
+        pass
+
+    async def get_state_instance(self, id_instance: str, api_token: str) -> str | None:
+        if self.get_state_should_fail:
+            raise RuntimeError("state boom")
+        if self._state_sequence:
+            return self._state_sequence.pop(0)
+        return "notAuthorized"
+
+    async def get_qr_ws(self, id_instance: str, api_token: str, **kwargs) -> dict:
+        if self.qr_should_fail:
+            raise RuntimeError("QR fetch boom")
+        return self.qr_response
+
+    async def logout(self, id_instance: str, api_token: str) -> None:
+        pass
+
+    async def delete_instance(self, instance_id: str) -> None:
+        pass
+
+
+class FailingProvisioner:
+    """Provisioner whose create_connection always raises."""
+
+    async def create_connection(self, config: ConnectionConfig) -> CreatedConnection:
+        raise RuntimeError("provision boom")
+
+
+# --- Fixtures --------------------------------------------------------------
+
+
+def _make_service(
+    *,
+    bot=None,
+    user_repo=None,
+    connection_repo=None,
+    green_client=None,
+    provisioner=None,
+    webhook_base_url="https://echo.example.com",
+    poll_interval=0.01,
+    poll_max_attempts=3,
+) -> tuple[OnboardingService, FakeBot, FakeUserRepo, InMemoryWhatsAppConnectionRepository, FakeGreenClient]:
+    bot = bot or FakeBot()
+    user_repo = user_repo or FakeUserRepo()
+    connection_repo = connection_repo or InMemoryWhatsAppConnectionRepository()
+    green_client = green_client or FakeGreenClient(otp_code="87654321")
+    if provisioner is None:
+        provisioner = GreenProvisioner(
+            client=green_client,
+            credential_resolver=connection_repo,
+        )
+    service = OnboardingService(
+        bot=bot,
+        user_repo=user_repo,
+        connection_repo=connection_repo,
+        provisioner=provisioner,
+        green_client=green_client,
+        webhook_base_url=webhook_base_url,
+        poll_interval=poll_interval,
+        poll_max_attempts=poll_max_attempts,
+    )
+    return service, bot, user_repo, connection_repo, green_client
+
+
+async def _start_and_name(
+    service: OnboardingService, phone: str = PHONE, name: str = "Dana"
+) -> None:
+    """Helper: consent → create user → send name → click [חבר אותי].
+
+    In the click-driven flow, provisioning starts only after the user
+    clicks [חבר אותי]. This helper simulates that click.
+    """
+    await service.start_onboarding(phone)
+    await service.handle_name_response(phone, name)
+    await service.handle_onboarding_connect(phone)
+
+
+# --- start_onboarding: failed / create_user failure -----------------------
+
+
+async def test_failed_user_retries_onboarding():
+    """User with 'failed' status falls through to create a new instance."""
+    user_repo = FakeUserRepo(allow_recreate=True)
+    service, bot, user_repo, _conn, green_client = _make_service(
+        user_repo=user_repo
+    )
+
+    # Pre-create a user in 'failed' state.
+    await user_repo.create_user(PHONE, onboarding_status="failed")
+    assert (await user_repo.get_by_phone(PHONE))[1] == "failed"
+
+    # start_onboarding for failed user → creates new user (pending), asks name.
+    await service.start_onboarding(PHONE)
+
+    # User is now pending, name prompt sent.
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "pending"
+    assert len(bot.sent) == 1  # name prompt
+
+    # Send name → [חבר אותי] button sent (no auto-provisioning).
+    await service.handle_name_response(PHONE, "Dana")
+    assert len(bot.sent_buttons) == 1
+    # Click [חבר אותי] → provisioning starts (pool miss: background create).
+    await service.handle_onboarding_connect(PHONE)
+    await asyncio.sleep(0.2)
+    # Instance ready, [הצג QR] button sent. Click it.
+    await service.handle_onboarding_show_qr(PHONE)
+    await asyncio.sleep(0.2)
+
+    # A new instance was provisioned; QR sent (default path), no OTP.
+    assert len(green_client.otp_calls) == 0
+    assert len(bot.sent_images) == 1
+
+
+async def test_create_user_exception_returns():
+    """create_user raising → logged and returns silently."""
+    user_repo = FakeUserRepo()
+    user_repo.create_should_fail = True
+    service, bot, _user_repo, _conn, green_client = _make_service(
+        user_repo=user_repo
+    )
+
+    await service.start_onboarding(PHONE)
+
+    assert len(green_client.otp_calls) == 0
+    assert len(bot.sent) == 0
+
+
+# --- _provision_and_poll: provisioner / OTP failures -----------------------
+
+
+async def test_provisioner_create_connection_fails():
+    """provisioner.create_connection raising → status=failed + failure msg."""
+    service, bot, user_repo, _conn, green_client = _make_service(
+        provisioner=FailingProvisioner()
+    )
+
+    await _start_and_name(service)
+    await asyncio.sleep(0.2)
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is not None
+    assert user[1] == "failed"
+    assert len(green_client.otp_calls) == 0
+    # name prompt + "preparing" + failure message.
+    assert len(bot.sent) == 3
+    _phone, failure_msg = bot.sent[2]
+    assert "מצטער" in failure_msg
+
+
+async def test_get_authorization_code_fails():
+    """OTP fallback's getAuthorizationCode raising → status=failed + failure msg.
+
+    The default path is QR; to exercise the OTP failure path we make the QR
+    fetch fail (which triggers the OTP fallback), and the OTP fetch fail too.
+    """
+    green_client = FakeGreenClient(otp_code="87654321")
+    green_client.qr_should_fail = True
+    green_client.get_auth_should_fail = True
+    service, bot, user_repo, _conn, green_client = _make_service(
+        green_client=green_client
+    )
+
+    # State sequence: notAuthorized (triggers QR fetch → fallback to OTP → fails).
+    green_client.set_state_sequence(["notAuthorized"])
+
+    await _start_and_name(service)
+    await asyncio.sleep(0.2)
+    # Pool miss: instance ready, [הצג QR] button sent. Click it.
+    await service.handle_onboarding_show_qr(PHONE)
+    await asyncio.sleep(0.2)
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is not None
+    assert user[1] == "failed"
+    # name prompt + "preparing" + OTP failure message.
+    assert len(bot.sent) == 3
+    _phone, failure_msg = bot.sent[2]
+    assert "מצטער" in failure_msg
+    assert "קוד האימות" in failure_msg
+
+
+# --- Consent-first: handle_unknown_event / send_introduction ---------------
+
+
+def _button_event(phone: str, button_id: str) -> BotEvent:
+    """Build a BUTTON_REPLY BotEvent for tests."""
+    return BotEvent(
+        event_id="test-evt",
+        user_phone=phone,
+        type=BotEventType.BUTTON_REPLY,
+        button_id=button_id,
+    )
+
+
+def _text_event(phone: str, text: str) -> BotEvent:
+    """Build a TEXT BotEvent for tests."""
+    return BotEvent(
+        event_id="test-evt",
+        user_phone=phone,
+        type=BotEventType.TEXT,
+        text=text,
+    )
+
+
+def _contact_event(phone: str) -> BotEvent:
+    """Build a CONTACT BotEvent for tests."""
+    from echo_v2.ports.bot import BotContact
+
+    return BotEvent(
+        event_id="test-evt",
+        user_phone=phone,
+        type=BotEventType.CONTACT,
+        contact=BotContact(phone="+972500000000", name="Test"),
+    )
+
+
+async def test_handle_unknown_event_start_button_triggers_onboarding():
+    """onboarding:start button → start_onboarding (creates user, asks name)."""
+    service, _bot, user_repo, _conn, _green_client = _make_service()
+
+    event = _button_event(PHONE, "onboarding:start")
+    await service.handle_unknown_event(event)
+
+    # User was created (pending, no name yet, no provisioning).
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is not None
+    assert user[1] == "pending"
+    assert user[2] is None
+
+
+async def test_handle_unknown_event_info_button_sends_explanation():
+    """onboarding:info button → send_explanation (no user created, no Green call)."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+
+    event = _button_event(PHONE, "onboarding:info")
+    await service.handle_unknown_event(event)
+
+    # No user created.
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is None
+    # No OTP call.
+    assert len(green_client.otp_calls) == 0
+    # Explanation buttons sent.
+    assert len(bot.sent_buttons) == 1
+    _phone, body, buttons = bot.sent_buttons[0]
+    assert _phone == PHONE
+    assert "WhatsApp" in body
+    # Only the connect button (not the info button again).
+    assert len(buttons) == 1
+    assert buttons[0]["id"] == "onboarding:start"
+
+
+async def test_handle_unknown_event_text_consent_phrase_triggers_onboarding():
+    """Text 'חברו אותי' → start_onboarding (fallback for button delivery failure)."""
+    service, _bot, user_repo, _conn, _green_client = _make_service()
+
+    event = _text_event(PHONE, "חברו אותי")
+    await service.handle_unknown_event(event)
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is not None
+    assert user[1] == "pending"
+
+
+async def test_handle_unknown_event_text_hello_sends_intro():
+    """Text 'hello' (not the consent phrase) → send_introduction, no user created."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+
+    event = _text_event(PHONE, "hello")
+    await service.handle_unknown_event(event)
+
+    # No user created, no OTP.
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is None
+    assert len(green_client.otp_calls) == 0
+    # Intro buttons sent.
+    assert len(bot.sent_buttons) == 1
+    _phone, body, buttons = bot.sent_buttons[0]
+    assert _phone == PHONE
+    assert "Echo" in body
+    assert len(buttons) == 2
+    ids = [b["id"] for b in buttons]
+    assert "onboarding:start" in ids
+    assert "onboarding:info" in ids
+
+
+async def test_handle_unknown_event_generic_yes_does_not_trigger_onboarding():
+    """Text 'כן' is NOT accepted as consent — only the deliberate phrase."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+
+    event = _text_event(PHONE, "כן")
+    await service.handle_unknown_event(event)
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is None
+    # Intro sent instead.
+    assert len(bot.sent_buttons) == 1
+
+
+async def test_handle_unknown_event_unknown_button_sends_intro():
+    """Unknown button_id → send_introduction."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+
+    event = _button_event(PHONE, "something:else")
+    await service.handle_unknown_event(event)
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is None
+    assert len(bot.sent_buttons) == 1
+
+
+async def test_handle_unknown_event_contact_sends_intro():
+    """CONTACT event from unknown user → send_introduction."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+
+    event = _contact_event(PHONE)
+    await service.handle_unknown_event(event)
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is None
+    assert len(bot.sent_buttons) == 1
+
+
+async def test_send_introduction_sends_two_buttons():
+    """send_introduction sends the intro body with start + info buttons."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+
+    await service.send_introduction(PHONE)
+
+    assert len(bot.sent_buttons) == 1
+    _phone, body, buttons = bot.sent_buttons[0]
+    assert _phone == PHONE
+    assert "רוצה להתחבר" in body
+    assert len(buttons) == 2
+    assert buttons[0]["id"] == "onboarding:start"
+    assert buttons[1]["id"] == "onboarding:info"
+
+
+async def test_send_explanation_sends_one_button():
+    """send_explanation sends the info body with only the connect button."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+
+    await service.send_explanation(PHONE)
+
+    assert len(bot.sent_buttons) == 1
+    _phone, body, buttons = bot.sent_buttons[0]
+    assert _phone == PHONE
+    assert "מכשיר מקושר" in body
+    assert len(buttons) == 1
+    assert buttons[0]["id"] == "onboarding:start"
+
+
+async def test_send_introduction_send_failure_does_not_crash():
+    """If send_buttons raises in send_introduction, it logs and returns."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+    bot.send_buttons_should_fail = True
+
+    # Should not raise.
+    await service.send_introduction(PHONE)
+
+
+# --- _poll_until_authorized: authorized / exception / timeout ---------------
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    """Patch asyncio.sleep to a no-op so polling loops run instantly."""
+
+    async def _fake_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _fake_sleep)
+
+
+async def test_poll_until_authorized_detects_authorized(no_sleep):
+    """Poll finds 'authorized' → completes onboarding (status=active)."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await user_repo.update_first_name(user_id, "Dana")
+
+    green_client.set_state_sequence(["authorized"])
+
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    # handle_connection_established ran → status active + welcome sent.
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "active"
+    assert len(bot.sent) == 1
+    _phone, welcome = bot.sent[0]
+    assert "היי" in welcome
+
+
+async def test_poll_until_authorized_exception_then_authorized(no_sleep):
+    """Transient exception during poll is swallowed, polling continues."""
+    service, _bot, user_repo, _conn, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await user_repo.update_first_name(user_id, "Dana")
+
+    # First call raises, then succeed with 'authorized'.
+    call_count = {"n": 0}
+
+    async def _flaky(id_instance, api_token):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("transient 401")
+        return "authorized"
+
+    green_client.get_state_instance = _flaky  # type: ignore[assignment]
+
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "active"
+
+
+async def test_poll_until_authorized_times_out(no_sleep):
+    """Poll never sees 'authorized' → times out, user remains pending.
+
+    If the instance became ready (notAuthorized) and QR was sent, but the
+    user never authorized, the user remains ``pending`` so they can retry
+    via 'qr' or 'קוד'. The timeout message tells them to reply 'קוד' for a fresh code.
+    """
+    service, bot, user_repo, _conn, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await user_repo.update_first_name(user_id, "Dana")
+
+    # Always returns notAuthorized (instance ready, QR sent, but never authorized).
+    green_client.set_state_sequence(["notAuthorized"] * 30)
+
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    # No welcome sent — onboarding not completed by the poll.
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "pending"
+    # QR image sent + timeout message sent.
+    assert len(bot.sent_images) == 1
+    assert len(bot.sent) == 1
+    _phone, msg = bot.sent[0]
+    assert _phone == PHONE
+    assert "לא התחברת בזמן" in msg
+    assert "קוד" in msg
+
+
+async def test_poll_timeout_user_remains_pending_and_resend_works(no_sleep):
+    """After timeout (instance ready, OTP sent), user remains pending and 'קוד' works."""
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await user_repo.update_first_name(user_id, "Dana")
+
+    # Store a connection row so _resend_otp can find it.
+    from echo_v2.persistence.whatsapp_connections import StoredConnection
+    from echo_v2.ports.whatsapp import (
+        ConnectionRef,
+        ConnectionStatus,
+        ProviderCredentials,
+    )
+
+    conn = StoredConnection(
+        user_id=user_id,
+        ref=ConnectionRef(provider="green", provider_connection_id="inst-1"),
+        credentials=ProviderCredentials(data=b"token-1"),
+        webhook_token_hash=b"\x00" * 32,
+        status=ConnectionStatus.PROVISIONING,
+    )
+    await conn_repo.save(conn)
+
+    # Poll times out (instance ready, OTP sent, but user didn't authorize).
+    green_client.set_state_sequence(["notAuthorized"] * 30)
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    # User remains pending (can retry via 'קוד').
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "pending"
+
+    # Replying 'קוד' triggers a fresh OTP.
+    sent_before = len(bot.sent)
+    otp_calls_before = len(green_client.otp_calls)
+    await service.handle_resend_request(PHONE)
+
+    # A new OTP was requested and a new OTP message was sent.
+    assert len(green_client.otp_calls) == otp_calls_before + 1
+    assert len(bot.sent) == sent_before + 1
+    _phone, otp_msg = bot.sent[-1]
+    assert "הקוד שלך" in otp_msg
+
+
+async def test_poll_timeout_send_failure_does_not_crash(no_sleep):
+    """If sending the timeout message raises, polling still exits cleanly."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await user_repo.update_first_name(user_id, "Dana")
+
+    green_client.set_state_sequence(["notAuthorized"] * 30)
+
+    # Make send_text raise on the timeout message.
+    call_count = {"n": 0}
+
+    async def _failing_send(phone, text):
+        call_count["n"] += 1
+        # The timeout message is the only send in this test path.
+        raise RuntimeError("bot send boom")
+
+    bot.send_text = _failing_send  # type: ignore[assignment]
+
+    # Should not raise.
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    # The timeout send was attempted.
+    assert call_count["n"] >= 1
+    # User remains pending (instance was ready, OTP sent, but not authorized).
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "pending"
+
+
+async def test_poll_sends_otp_once_on_not_authorized(no_sleep):
+    """QR is sent exactly once when state reaches 'notAuthorized'."""
+    service, bot, _user_repo, _conn, green_client = _make_service()
+
+    user_id = await _ensure_user(service)
+
+    # notAuthorized multiple times, then authorized.
+    green_client.set_state_sequence(
+        ["notAuthorized", "notAuthorized", "notAuthorized", "authorized"]
+    )
+
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    # No OTP requested (QR is the default path).
+    assert len(green_client.otp_calls) == 0
+    # QR image sent exactly once despite multiple notAuthorized states.
+    assert len(bot.sent_images) == 1
+
+
+async def _ensure_user(service: OnboardingService) -> str:
+    """Create a pending user with a name for poll tests."""
+    user_repo = service._user_repo  # type: ignore[attr-defined]
+    user_id = await user_repo.create_user(PHONE, first_name="Dana")
+    await user_repo.update_first_name(user_id, "Dana")
+    return user_id
+
+
+# --- handle_resend_request: invalid phone / unknown / not pending -----------
+
+
+async def test_resend_request_invalid_phone():
+    """Invalid phone → returns silently."""
+    service, bot, _user_repo, _conn, green_client = _make_service()
+
+    handled = await service.handle_resend_request("not-a-phone")
+
+    assert handled is False
+    assert len(green_client.otp_calls) == 0
+    assert len(bot.sent) == 0
+
+
+async def test_resend_request_unknown_user():
+    """Unknown user → returns False."""
+    service, bot, _user_repo, _conn, green_client = _make_service()
+
+    handled = await service.handle_resend_request(PHONE)
+
+    assert handled is False
+    assert len(green_client.otp_calls) == 0
+    assert len(bot.sent) == 0
+
+
+async def test_resend_request_no_connection():
+    """Known user with no connection row → returns False, no OTP."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="active")
+    await user_repo.update_onboarding_status(user_id, "active")
+
+    handled = await service.handle_resend_request(PHONE)
+
+    assert handled is False
+    assert len(green_client.otp_calls) == 0
+    assert len(bot.sent) == 0
+
+
+async def test_resend_request_active_user_notAuthorized_issues_otp():
+    """Active user with connection, Green says notAuthorized → fresh OTP issued."""
+    from echo_v2.persistence.whatsapp_connections import StoredConnection
+    from echo_v2.ports.whatsapp import (
+        ConnectionRef,
+        ConnectionStatus,
+        ProviderCredentials,
+    )
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="active")
+    await user_repo.update_onboarding_status(user_id, "active")
+
+    conn = StoredConnection(
+        user_id=user_id,
+        ref=ConnectionRef(provider="green", provider_connection_id="inst-1"),
+        credentials=ProviderCredentials(data=b"token-1"),
+        webhook_token_hash=b"\x00" * 32,
+        status=ConnectionStatus.CONNECTED,
+    )
+    await conn_repo.save(conn)
+
+    # Green says notAuthorized (instance disconnected, needs re-pair).
+    green_client.set_state_sequence(["notAuthorized"])
+
+    handled = await service.handle_resend_request(PHONE)
+
+    assert handled is True
+    assert len(green_client.otp_calls) == 1
+    assert len(bot.sent) == 1
+    _phone, msg = bot.sent[0]
+    assert "הקוד שלך" in msg
+
+
+async def test_resend_request_pending_user_authorized_completes_active():
+    """Stale DB (pending), Green says authorized → 'already connected', DB → active."""
+    from echo_v2.persistence.whatsapp_connections import StoredConnection
+    from echo_v2.ports.whatsapp import (
+        ConnectionRef,
+        ConnectionStatus,
+        ProviderCredentials,
+    )
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+
+    # Stale DB: pending, but Green says authorized.
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    conn = StoredConnection(
+        user_id=user_id,
+        ref=ConnectionRef(provider="green", provider_connection_id="inst-1"),
+        credentials=ProviderCredentials(data=b"token-1"),
+        webhook_token_hash=b"\x00" * 32,
+        status=ConnectionStatus.PROVISIONING,
+    )
+    await conn_repo.save(conn)
+
+    green_client.set_state_sequence(["authorized"])
+
+    handled = await service.handle_resend_request(PHONE)
+
+    assert handled is True
+    assert len(green_client.otp_calls) == 0
+    assert len(bot.sent) == 1
+    _phone, msg = bot.sent[0]
+    assert "כבר מחובר" in msg
+    # DB updated from pending → active.
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "active"
+
+
+async def test_resend_request_failed_user_issues_otp():
+    """Failed user with connection → fresh OTP issued (Green is the gate, not DB status)."""
+    from echo_v2.persistence.whatsapp_connections import StoredConnection
+    from echo_v2.ports.whatsapp import (
+        ConnectionRef,
+        ConnectionStatus,
+        ProviderCredentials,
+    )
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="failed")
+    await user_repo.update_onboarding_status(user_id, "failed")
+
+    conn = StoredConnection(
+        user_id=user_id,
+        ref=ConnectionRef(provider="green", provider_connection_id="inst-1"),
+        credentials=ProviderCredentials(data=b"token-1"),
+        webhook_token_hash=b"\x00" * 32,
+        status=ConnectionStatus.PROVISIONING,
+    )
+    await conn_repo.save(conn)
+
+    green_client.set_state_sequence(["notAuthorized"])
+
+    handled = await service.handle_resend_request(PHONE)
+
+    assert handled is True
+    assert len(green_client.otp_calls) == 1
+    assert len(bot.sent) == 1
+    assert "הקוד שלך" in bot.sent[0][1]
+
+
+async def test_resend_request_returns_false_for_unknown_user():
+    """Unknown user → returns False (so dispatch can fall through to intro)."""
+    service, _bot, _user_repo, _conn, green_client = _make_service()
+
+    handled = await service.handle_resend_request(PHONE)
+
+    assert handled is False
+    assert len(green_client.otp_calls) == 0
+
+
+# --- handle_connection_established: already active -------------------------
+
+
+async def test_connection_established_already_active_skips_welcome():
+    """Already-active user → welcome skipped."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+
+    user_id = await user_repo.create_user(
+        PHONE, onboarding_status="active", first_name="Dana"
+    )
+    await user_repo.update_onboarding_status(user_id, "active")
+
+    await service.handle_connection_established(user_id, PHONE)
+
+    assert len(bot.sent) == 0
+
+
+# --- handle_connection_established_by_id: no phone -------------------------
+
+
+async def test_connection_established_by_id_no_phone_lookup():
+    """User repo without get_phone_by_id → _lookup_phone None → return."""
+    user_repo = FakeUserRepoNoPhoneLookup()
+    service, bot, _user_repo, _conn, _green_client = _make_service(
+        user_repo=user_repo
+    )
+
+    await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    # No phone resolvable — should return without sending welcome.
+    await service.handle_connection_established_by_id("some-user-id")
+
+    assert len(bot.sent) == 0
+
+
+# --- handle_disconnect_notification --------------------------------------
+
+
+async def test_disconnect_notification_active_user():
+    """Active user → disconnect notification sent."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+
+    user_id = await user_repo.create_user(
+        PHONE, onboarding_status="active", first_name="Dana"
+    )
+    await user_repo.update_onboarding_status(user_id, "active")
+
+    await service.handle_disconnect_notification(user_id)
+
+    assert len(bot.sent) == 1
+    _phone, msg = bot.sent[0]
+    assert _phone == PHONE
+    assert "התנתק" in msg
+    assert "קוד" in msg
+
+
+async def test_disconnect_notification_pending_user_suppressed():
+    """Pending user → no notification (poll handles their case)."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    await service.handle_disconnect_notification(user_id)
+
+    assert len(bot.sent) == 0
+
+
+async def test_disconnect_notification_failed_user_suppressed():
+    """Failed user → no notification."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="failed")
+    await user_repo.update_onboarding_status(user_id, "failed")
+
+    await service.handle_disconnect_notification(user_id)
+
+    assert len(bot.sent) == 0
+
+
+async def test_disconnect_notification_no_phone_lookup():
+    """User repo without get_phone_by_id → no crash, no send."""
+    user_repo = FakeUserRepoNoPhoneLookup()
+    service, bot, _user_repo, _conn, _green_client = _make_service(
+        user_repo=user_repo
+    )
+
+    await user_repo.create_user(PHONE, onboarding_status="active")
+
+    await service.handle_disconnect_notification("some-user-id")
+
+    assert len(bot.sent) == 0
+
+
+async def test_disconnect_notification_send_failure_logged():
+    """Bot send failure is caught and logged, does not crash."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+    bot.send_text_should_fail = True
+
+    user_id = await user_repo.create_user(
+        PHONE, onboarding_status="active", first_name="Dana"
+    )
+    await user_repo.update_onboarding_status(user_id, "active")
+
+    # Should not raise.
+    await service.handle_disconnect_notification(user_id)
+
+
+# --- handle_name_response: invalid phone / unknown / empty name ------------
+
+
+async def test_name_response_invalid_phone():
+    """Invalid phone → returns False."""
+    service, _bot, _user_repo, _conn, _green_client = _make_service()
+
+    handled = await service.handle_name_response("not-a-phone", "Dana")
+    assert handled is False
+
+
+async def test_name_response_unknown_user():
+    """Unknown user → returns False."""
+    service, _bot, _user_repo, _conn, _green_client = _make_service()
+
+    handled = await service.handle_name_response(PHONE, "Dana")
+    assert handled is False
+
+
+async def test_name_response_empty_name():
+    """Blank name → returns False."""
+    service, _bot, user_repo, _conn, _green_client = _make_service()
+
+    await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    handled = await service.handle_name_response(PHONE, "   ")
+    assert handled is False
+
+
+# --- is_onboarding: invalid phone ------------------------------------------
+
+
+async def test_is_onboarding_invalid_phone():
+    """Invalid phone → returns False."""
+    service, _bot, _user_repo, _conn, _green_client = _make_service()
+
+    assert await service.is_onboarding("not-a-phone") is False
+
+
+# --- _resend_otp: no connection / get_code failure --------------------------
+
+
+async def test_resend_otp_no_connection():
+    """Pending user with no stored connection → returns False, no OTP."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await user_repo.update_onboarding_status(user_id, "pending")
+
+    handled = await service.handle_resend_request(PHONE)
+
+    assert handled is False
+    assert len(green_client.otp_calls) == 0
+    # No OTP message sent because no connection exists.
+    assert len(bot.sent) == 0
+
+
+async def test_resend_otp_get_code_fails():
+    """getAuthorizationCode failing during resend → error message."""
+    green_client = FakeGreenClient(otp_code="87654321")
+    service, bot, _user_repo, _conn, green_client = _make_service(
+        green_client=green_client
+    )
+
+    # Full flow: consent → name → connect → show_qr (QR sent by default).
+    await _start_and_name(service)
+    await asyncio.sleep(0.2)
+    # Pool miss: instance ready, [הצג QR] button sent. Click it.
+    await service.handle_onboarding_show_qr(PHONE)
+    await asyncio.sleep(0.2)
+    assert len(green_client.otp_calls) == 0
+    assert len(bot.sent_images) == 1
+
+    # Now make the resend fail to get a new code.
+    green_client.get_auth_should_fail = True
+    sent_before = len(bot.sent)
+    await service.handle_resend_request(PHONE)
+
+    assert len(green_client.otp_calls) == 1
+    # An error message was sent.
+    assert len(bot.sent) == sent_before + 1
+    _phone, error_msg = bot.sent[-1]
+    assert "לא הצלחתי לקבל קוד" in error_msg
+
+
+# --- send_introduction / send_explanation: invalid phone / send failure -------
+
+
+async def test_send_introduction_invalid_phone():
+    """Invalid phone in send_introduction → logged and returns."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+    await service.send_introduction("not-a-phone")
+    assert len(bot.sent_buttons) == 0
+
+
+async def test_send_explanation_invalid_phone():
+    """Invalid phone in send_explanation → logged and returns."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+    await service.send_explanation("not-a-phone")
+    assert len(bot.sent_buttons) == 0
+
+
+async def test_send_explanation_send_failure_does_not_crash():
+    """If send_buttons raises in send_explanation, it logs and returns."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+    bot.send_buttons_should_fail = True
+    await service.send_explanation(PHONE)  # should not raise
+
+
+# --- start_onboarding: re-entry with connection in various states --------------
+
+
+def _make_connection(user_id, status, conn_repo):
+    """Helper: store a connection with the given status."""
+    from echo_v2.persistence.whatsapp_connections import StoredConnection
+    from echo_v2.ports.whatsapp import (
+        ConnectionRef,
+        ProviderCredentials,
+    )
+
+    conn = StoredConnection(
+        user_id=user_id,
+        ref=ConnectionRef(provider="green", provider_connection_id="inst-1"),
+        credentials=ProviderCredentials(data=b"token-1"),
+        webhook_token_hash=b"\x00" * 32,
+        status=status,
+    )
+    return conn
+
+
+async def test_start_onboarding_pending_with_provisioning_connection():
+    """Re-entry: pending + name + PROVISIONING → 'still preparing'."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, _green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, first_name="Dana")
+    await user_repo.update_first_name(user_id, "Dana")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PROVISIONING, conn_repo))
+
+    await service.start_onboarding(PHONE)
+
+    still_msgs = [m for _p, m in bot.sent if "עדיין מכין" in m]
+    assert len(still_msgs) == 1
+
+
+async def test_start_onboarding_pending_with_pairing_required_connection():
+    """Re-entry: pending + name + PAIRING_REQUIRED → [הצג QR] button."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, _green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, first_name="Dana")
+    await user_repo.update_first_name(user_id, "Dana")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PAIRING_REQUIRED, conn_repo))
+
+    await service.start_onboarding(PHONE)
+
+    ready_buttons = [
+        (p, b, btns) for p, b, btns in bot.sent_buttons
+        if any(x["id"] == "onboarding:show_qr" for x in btns)
+    ]
+    assert len(ready_buttons) == 1
+
+
+async def test_start_onboarding_pending_with_connected_connection():
+    """Re-entry: pending + name + CONNECTED → resend QR."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, first_name="Dana")
+    await user_repo.update_first_name(user_id, "Dana")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.CONNECTED, conn_repo))
+
+    green_client.set_state_sequence(["notAuthorized"])
+    await service.start_onboarding(PHONE)
+
+    # QR resent via _resend_qr
+    assert len(bot.sent_images) == 1
+
+
+# --- start_pairing: existing connection re-click ------------------------------
+
+
+async def test_start_pairing_existing_provisioning():
+    """Re-click [חבר אותי] with PROVISIONING connection → 'still preparing'."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, _green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, first_name="Dana")
+    await user_repo.update_first_name(user_id, "Dana")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PROVISIONING, conn_repo))
+
+    await service.start_pairing(user_id, PHONE)
+
+    still_msgs = [m for _p, m in bot.sent if "עדיין מכין" in m]
+    assert len(still_msgs) == 1
+
+
+async def test_start_pairing_existing_pairing_required_sends_qr():
+    """Re-click [חבר אותי] with PAIRING_REQUIRED → re-send QR + poll."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, first_name="Dana")
+    await user_repo.update_first_name(user_id, "Dana")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PAIRING_REQUIRED, conn_repo))
+
+    green_client.set_state_sequence(["authorized"])
+    await service.start_pairing(user_id, PHONE)
+    await asyncio.sleep(0.2)
+
+    assert len(bot.sent_images) == 1
+
+
+# --- start_pairing: pool hit --------------------------------------------------
+
+
+async def test_start_pairing_pool_hit_sends_qr():
+    """Pool hit in start_pairing → QR sent immediately."""
+    from echo_v2.persistence.green_instance_pool import (
+        InMemoryGreenInstancePoolRepository,
+    )
+    from echo_v2.services.green_instance_pool import GreenInstancePool
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+
+    pool_repo = InMemoryGreenInstancePoolRepository()
+    pool = GreenInstancePool(
+        provisioner=service._provisioner,
+        green_client=green_client,
+        repo=pool_repo,
+        connection_repo=conn_repo,
+        webhook_base_url="https://echo.example.com",
+        target_size=1,
+        ready_poll_interval=0.01,
+        ready_max_attempts=3,
+    )
+    row_id = await pool_repo.reserve_creation_slot(1)
+    assert row_id is not None
+    from echo_v2.ports.whatsapp import ConnectionRef, ProviderCredentials
+    await pool_repo.mark_created(
+        row_id,
+        ConnectionRef(provider="green", provider_connection_id="pool-inst-1"),
+        ProviderCredentials(data=b"pool-token-1"),
+        b"fake-hash",
+    )
+    await pool_repo.mark_available(row_id)
+
+    service_with_pool = OnboardingService(
+        bot=bot,
+        user_repo=user_repo,
+        connection_repo=conn_repo,
+        provisioner=service._provisioner,
+        green_client=green_client,
+        webhook_base_url="https://echo.example.com",
+        poll_interval=0.01,
+        poll_max_attempts=3,
+        pool=pool,
+    )
+
+    green_client.set_state_sequence(["authorized"])
+
+    user_id = await user_repo.create_user(PHONE, first_name="Dana")
+    await user_repo.update_first_name(user_id, "Dana")
+
+    await service_with_pool.start_pairing(user_id, PHONE)
+    await asyncio.sleep(0.3)
+
+    assert len(bot.sent_images) == 1
+    await pool.aclose()
+
+
+# --- _prepare_instance: pool refill + failure message send failure ------------
+
+
+async def test_prepare_instance_pool_refill_requested():
+    """_prepare_instance with pool → request_refill called after save."""
+    from echo_v2.persistence.green_instance_pool import (
+        InMemoryGreenInstancePoolRepository,
+    )
+    from echo_v2.services.green_instance_pool import GreenInstancePool
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+
+    pool_repo = InMemoryGreenInstancePoolRepository()
+    pool = GreenInstancePool(
+        provisioner=service._provisioner,
+        green_client=green_client,
+        repo=pool_repo,
+        connection_repo=conn_repo,
+        webhook_base_url="https://echo.example.com",
+        target_size=1,
+        ready_poll_interval=0.01,
+        ready_max_attempts=3,
+    )
+
+    service_with_pool = OnboardingService(
+        bot=bot,
+        user_repo=user_repo,
+        connection_repo=conn_repo,
+        provisioner=service._provisioner,
+        green_client=green_client,
+        webhook_base_url="https://echo.example.com",
+        poll_interval=0.01,
+        poll_max_attempts=3,
+        pool=pool,
+    )
+
+    green_client.set_state_sequence(["notAuthorized", "authorized"])
+
+    await service_with_pool.start_onboarding(PHONE)
+    await service_with_pool.handle_name_response(PHONE, "Dana")
+    await service_with_pool.handle_onboarding_connect(PHONE)
+    await asyncio.sleep(0.3)
+
+    # Instance was created (pool miss path with pool present).
+    user = await user_repo.get_by_phone(PHONE)
+    assert user is not None
+    # [הצג QR] button was sent (instance ready).
+    ready_buttons = [
+        (p, b, btns) for p, b, btns in bot.sent_buttons
+        if any(x["id"] == "onboarding:show_qr" for x in btns)
+    ]
+    assert len(ready_buttons) == 1
+    await pool.aclose()
+
+
+async def test_prepare_instance_failure_message_send_fails():
+    """Provisioner fails AND failure message send fails → logged, no crash."""
+    service, bot, user_repo, _conn, _green_client = _make_service(
+        provisioner=FailingProvisioner()
+    )
+
+    # Make send_text fail only for the failure message.
+    async def _selective_fail(phone, text):
+        if "מצטער" in text:
+            raise RuntimeError("send boom")
+        bot.sent.append((phone, text))
+    bot.send_text = _selective_fail  # type: ignore[assignment]
+
+    await service.start_onboarding(PHONE)
+    await service.handle_name_response(PHONE, "Dana")
+    await service.handle_onboarding_connect(PHONE)
+    await asyncio.sleep(0.2)
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "failed"
+
+
+# --- show_pairing_qr: no connection / provisioning ----------------------------
+
+
+async def test_show_pairing_qr_no_connection_starts_pairing():
+    """show_pairing_qr with no connection → falls back to start_pairing."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, first_name="Dana")
+    await user_repo.update_first_name(user_id, "Dana")
+
+    green_client.set_state_sequence(["notAuthorized", "authorized"])
+
+    await service.show_pairing_qr(user_id, PHONE)
+    await asyncio.sleep(0.2)
+
+    # start_pairing with pool miss → "preparing" message.
+    preparing_msgs = [m for _p, m in bot.sent if "מכין" in m]
+    assert len(preparing_msgs) >= 1
+
+
+async def test_show_pairing_qr_provisioning_sends_still_preparing():
+    """show_pairing_qr with PROVISIONING connection → 'still preparing'."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, _green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, first_name="Dana")
+    await user_repo.update_first_name(user_id, "Dana")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PROVISIONING, conn_repo))
+
+    await service.show_pairing_qr(user_id, PHONE)
+
+    still_msgs = [m for _p, m in bot.sent if "עדיין מכין" in m]
+    assert len(still_msgs) == 1
+
+
+# --- _claim_pool_and_send_qr: pool exists but empty ---------------------------
+
+
+async def test_claim_pool_and_send_qr_pool_empty_returns_false():
+    """Pool exists but claim returns None → returns False."""
+    from echo_v2.persistence.green_instance_pool import (
+        InMemoryGreenInstancePoolRepository,
+    )
+    from echo_v2.services.green_instance_pool import GreenInstancePool
+
+    service, _bot, user_repo, conn_repo, green_client = _make_service()
+
+    pool_repo = InMemoryGreenInstancePoolRepository()
+    pool = GreenInstancePool(
+        provisioner=service._provisioner,
+        green_client=green_client,
+        repo=pool_repo,
+        connection_repo=conn_repo,
+        webhook_base_url="https://echo.example.com",
+        target_size=1,
+        ready_poll_interval=0.01,
+        ready_max_attempts=3,
+    )
+
+    service_with_pool = OnboardingService(
+        bot=service._bot,
+        user_repo=user_repo,
+        connection_repo=conn_repo,
+        provisioner=service._provisioner,
+        green_client=green_client,
+        webhook_base_url="https://echo.example.com",
+        poll_interval=0.01,
+        poll_max_attempts=3,
+        pool=pool,
+    )
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    # Pool is empty (no available instances) → claim returns None → False.
+    result = await service_with_pool._claim_pool_and_send_qr(user_id, PHONE)
+    assert result is False
+
+    await pool.aclose()
+
+
+async def test_claim_pool_and_send_qr_pooled_no_pool():
+    """Pooled instance passed in, but service has no pool → skip finalize/refill."""
+    from echo_v2.persistence.green_instance_pool import PooledInstance
+    from echo_v2.ports.whatsapp import ConnectionRef, ProviderCredentials
+
+    service, bot, user_repo, _conn_repo, green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    # Build a PooledInstance manually (no pool on the service).
+    pooled = PooledInstance(
+        pool_row_id="row-1",
+        ref=ConnectionRef(provider="green", provider_connection_id="inst-1"),
+        credentials=ProviderCredentials(data=b"token-1"),
+        webhook_token_hash=b"\x00" * 32,
+    )
+
+    green_client.set_state_sequence(["authorized"])
+
+    result = await service._claim_pool_and_send_qr(user_id, PHONE, pooled=pooled)
+    assert result is True
+    # QR sent (conn was saved → _send_qr_and_poll).
+    assert len(bot.sent_images) == 1
+
+
+async def test_claim_pool_and_send_qr_conn_none_after_save():
+    """_claim_pool_and_send_qr: conn is None after save → return True (no QR sent)."""
+    from echo_v2.persistence.green_instance_pool import PooledInstance
+    from echo_v2.ports.whatsapp import ConnectionRef, ProviderCredentials
+
+    service, bot, user_repo, conn_repo, _green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    # Mock get_by_user to return None (conn not found after save).
+    async def _return_none(_user_id):
+        return None
+    conn_repo.get_by_user = _return_none  # type: ignore[assignment]
+
+    pooled = PooledInstance(
+        pool_row_id="row-1",
+        ref=ConnectionRef(provider="green", provider_connection_id="inst-1"),
+        credentials=ProviderCredentials(data=b"token-1"),
+        webhook_token_hash=b"\x00" * 32,
+    )
+
+    result = await service._claim_pool_and_send_qr(user_id, PHONE, pooled=pooled)
+    assert result is True
+    # No QR sent (conn was None → _send_qr_and_poll skipped).
+    assert len(bot.sent_images) == 0
+
+
+# --- _ensure_poll_task: duplicate ---------------------------------------------
+
+
+async def test_ensure_poll_task_duplicate_not_started():
+    """If a poll task is already running, don't start a second."""
+    service, _bot, _user_repo, _conn, _green_client = _make_service()
+
+    # Create a fake running task.
+    async def _long_running():
+        await asyncio.sleep(100)
+    service._poll_tasks["user-1"] = asyncio.create_task(_long_running())
+
+    service._ensure_poll_task("user-1", PHONE, "inst-1", "token-1")
+
+    # Only one task in the dict (the original).
+    assert len(service._poll_tasks) == 1
+
+    # Clean up.
+    service._poll_tasks["user-1"].cancel()
+    try:
+        await service._poll_tasks["user-1"]
+    except asyncio.CancelledError:
+        pass
+
+
+# --- _wait_until_ready: authorized during warmup ------------------------------
+
+
+async def test_wait_until_ready_authorized_returns_false():
+    """Instance already authorized during warmup → False (not a fresh slot)."""
+    service, _bot, _user_repo, _conn, green_client = _make_service()
+    green_client.set_state_sequence(["authorized"])
+    result = await service._wait_until_ready("inst-1", "token-1")
+    assert result is False
+
+
+async def test_wait_until_ready_transient_error_then_ready(no_sleep):
+    """Transient error during warmup poll → keep polling, eventually ready."""
+    service, _bot, _user_repo, _conn, green_client = _make_service()
+
+    call_count = {"n": 0}
+
+    async def _flaky(id_instance, api_token):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise RuntimeError("transient 401")
+        return "notAuthorized"
+
+    green_client.get_state_instance = _flaky  # type: ignore[assignment]
+
+    result = await service._wait_until_ready("inst-1", "token-1")
+    assert result is True
+
+
+# --- _poll_until_authorized: never ready / QR+OTP fail / starting state --------
+
+
+async def test_poll_until_authorized_never_ready_fails(no_sleep):
+    """Instance never becomes ready (stuck in 'starting') → user failed."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    green_client.set_state_sequence(["starting"] * 30)
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "failed"
+    failure_msgs = [m for _p, m in bot.sent if "מצטער" in m]
+    assert len(failure_msgs) == 1
+
+
+async def test_poll_until_authorized_never_ready_send_failure(no_sleep):
+    """Instance never ready + failure message send fails → logged, no crash."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    green_client.set_state_sequence(["starting"] * 30)
+    bot.send_text_should_fail = True
+
+    # Should not raise (failure message send is caught).
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "failed"
+
+
+async def test_poll_until_authorized_qr_fail_otp_fail_returns(no_sleep):
+    """QR fails and OTP fallback fails → poll returns early (user failed)."""
+    service, _bot, user_repo, _conn, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    green_client.qr_should_fail = True
+    green_client.get_auth_should_fail = True
+    green_client.set_state_sequence(["notAuthorized"])
+
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "failed"
+
+
+# --- handle_connection_established: existing is None --------------------------
+
+
+async def test_connection_established_no_existing_user():
+    """handle_connection_established with no user in DB → NameError (known edge)."""
+    service, _bot, _user_repo, _conn, _green_client = _make_service()
+
+    # Don't create a user — get_by_phone returns None, name is undefined.
+    with pytest.raises(NameError):
+        await service.handle_connection_established("unknown-id", PHONE)
+
+
+# --- handle_disconnect_notification: no existing user -------------------------
+
+
+async def test_disconnect_notification_no_existing_user():
+    """Disconnect notification for phone with no user → returns."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+
+    user_id = await user_repo.create_user(PHONE, onboarding_status="active")
+    await user_repo.update_onboarding_status(user_id, "active")
+    # Remove from _users so get_by_phone returns None, but get_phone_by_id still works.
+    del user_repo._users[PHONE]
+
+    await service.handle_disconnect_notification(user_id)
+    assert len(bot.sent) == 0
+
+
+# --- handle_onboarding_* public command methods -------------------------------
+
+
+async def test_handle_onboarding_code_delegates():
+    """handle_onboarding_code delegates to handle_resend_request."""
+    service, _bot, _user_repo, _conn, _green_client = _make_service()
+    handled = await service.handle_onboarding_code(PHONE)
+    assert handled is False  # unknown user
+
+
+async def test_handle_onboarding_qr_unknown_user():
+    """handle_onboarding_qr for unknown user → False."""
+    service, _bot, _user_repo, _conn, _green_client = _make_service()
+    handled = await service.handle_onboarding_qr(PHONE)
+    assert handled is False
+
+
+async def test_handle_onboarding_start_delegates():
+    """handle_onboarding_start delegates to start_onboarding."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+    await service.handle_onboarding_start(PHONE)
+    assert len(bot.sent) == 1  # name prompt
+
+
+async def test_handle_onboarding_connect_unknown_user():
+    """handle_onboarding_connect for unknown user → start_onboarding."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+    await service.handle_onboarding_connect(PHONE)
+    assert len(bot.sent) == 1  # name prompt
+
+
+async def test_handle_onboarding_connect_active_user():
+    """handle_onboarding_connect for active user → return (no action)."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+    user_id = await user_repo.create_user(
+        PHONE, onboarding_status="active", first_name="Dana"
+    )
+    await user_repo.update_onboarding_status(user_id, "active")
+    await service.handle_onboarding_connect(PHONE)
+    assert len(bot.sent) == 0
+
+
+async def test_handle_onboarding_show_qr_unknown_user():
+    """handle_onboarding_show_qr for unknown user → return."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+    await service.handle_onboarding_show_qr(PHONE)
+    assert len(bot.sent) == 0
+
+
+async def test_handle_onboarding_show_qr_active_user():
+    """handle_onboarding_show_qr for active user → return."""
+    service, bot, user_repo, _conn, _green_client = _make_service()
+    user_id = await user_repo.create_user(
+        PHONE, onboarding_status="active", first_name="Dana"
+    )
+    await user_repo.update_onboarding_status(user_id, "active")
+    await service.handle_onboarding_show_qr(PHONE)
+    assert len(bot.sent) == 0
+
+
+async def test_handle_onboarding_info_delegates():
+    """handle_onboarding_info delegates to send_explanation."""
+    service, bot, _user_repo, _conn, _green_client = _make_service()
+    await service.handle_onboarding_info(PHONE)
+    assert len(bot.sent_buttons) == 1
+
+
+# --- _resend_otp: state check exception / authorized stale branches ------------
+
+
+async def test_resend_otp_state_check_exception():
+    """get_state_instance raising during resend → state=None → proceeds to OTP."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, _bot, user_repo, conn_repo, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PROVISIONING, conn_repo))
+
+    green_client.get_state_should_fail = True
+    handled = await service.handle_resend_request(PHONE)
+    assert handled is True
+    assert len(green_client.otp_calls) == 1
+
+
+async def test_resend_otp_authorized_already_active():
+    """State authorized, user already active → 'already connected' (no DB update)."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="active")
+    await user_repo.update_onboarding_status(user_id, "active")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.CONNECTED, conn_repo))
+
+    green_client.set_state_sequence(["authorized"])
+    handled = await service.handle_resend_request(PHONE)
+    assert handled is True
+    assert "כבר מחובר" in bot.sent[0][1]
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "active"
+
+
+async def test_resend_otp_authorized_no_existing_user():
+    """State authorized, user not found by phone → 'already connected' sent."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PROVISIONING, conn_repo))
+
+    # Remove from _users so get_by_phone returns None inside _resend_otp.
+    del user_repo._users[PHONE]
+    green_client.set_state_sequence(["authorized"])
+
+    handled = await service._resend_otp(user_id, PHONE)
+    assert handled is True
+    assert "כבר מחובר" in bot.sent[0][1]
+
+
+# --- _send_pairing_qr: decode failure / passkey / timeout ----------------------
+
+
+async def test_send_pairing_qr_decode_failure_falls_back_to_otp(no_sleep):
+    """Invalid base64 in QR response → fallback to OTP."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    green_client.qr_response = {"type": "qrCode", "message": "!!!invalid"}
+    green_client.set_state_sequence(["notAuthorized"])
+
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    # OTP fallback used.
+    assert len(green_client.otp_calls) == 1
+    assert len(bot.sent_images) == 0
+
+
+async def test_send_pairing_qr_passkey_required_falls_back_to_otp(no_sleep):
+    """QR returns passkeyRequired → fallback to OTP."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    green_client.qr_response = {"type": "passkeyRequired"}
+    green_client.set_state_sequence(["notAuthorized"])
+
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    assert len(green_client.otp_calls) == 1
+    assert len(bot.sent_images) == 0
+
+
+async def test_send_pairing_qr_timeout_falls_back_to_otp(no_sleep):
+    """QR returns unknown type → TIMEOUT → fallback to OTP."""
+    service, bot, user_repo, _conn, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    green_client.qr_response = {"type": "unknownType"}
+    green_client.set_state_sequence(["notAuthorized"])
+
+    await service._poll_until_authorized(user_id, PHONE, "inst-1", "token-1")
+
+    assert len(green_client.otp_calls) == 1
+    assert len(bot.sent_images) == 0
+
+
+# --- _fallback_to_otp: send failure ------------------------------------------
+
+
+async def test_fallback_to_otp_qr_failed_notice_send_failure():
+    """If sending _QR_FAILED_FALLBACK fails, it's logged, OTP still sent."""
+    from echo_v2.ports.whatsapp import ConnectionRef
+
+    service, bot, user_repo, _conn, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+
+    sent_texts: list[tuple[str, str]] = []
+
+    async def _tracking_send(phone, text):
+        sent_texts.append((phone, text))
+        if "לא הצלחתי לשלוח את ה-QR" in text:
+            raise RuntimeError("send boom")
+    bot.send_text = _tracking_send  # type: ignore[assignment]
+
+    conn_ref = ConnectionRef(provider="green", provider_connection_id="inst-1")
+    result = await service._fallback_to_otp(user_id, PHONE, conn_ref, "token-1")
+    assert result is True
+    assert len(green_client.otp_calls) == 1
+    otp_msgs = [t for _p, t in sent_texts if "הקוד שלך" in t]
+    assert len(otp_msgs) == 1
+
+
+# --- _resend_qr: no connection / state exception / authorized -----------------
+
+
+async def test_resend_qr_no_connection():
+    """_resend_qr with no connection → False."""
+    service, _bot, user_repo, _conn, _green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    result = await service._resend_qr(user_id, PHONE)
+    assert result is False
+
+
+async def test_resend_qr_state_check_exception():
+    """get_state_instance raising during resend_qr → state=None → proceeds to QR."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PROVISIONING, conn_repo))
+
+    green_client.get_state_should_fail = True
+    result = await service._resend_qr(user_id, PHONE)
+    assert result is True
+    assert len(bot.sent_images) == 1
+
+
+async def test_resend_qr_authorized_completes_active():
+    """State authorized during resend_qr → 'already connected', DB → active."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PROVISIONING, conn_repo))
+
+    green_client.set_state_sequence(["authorized"])
+    result = await service._resend_qr(user_id, PHONE)
+    assert result is True
+    assert "כבר מחובר" in bot.sent[0][1]
+    user = await user_repo.get_by_phone(PHONE)
+    assert user[1] == "active"
+
+
+async def test_resend_qr_authorized_already_active():
+    """State authorized, user already active → 'already connected' (no DB update)."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="active")
+    await user_repo.update_onboarding_status(user_id, "active")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.CONNECTED, conn_repo))
+
+    green_client.set_state_sequence(["authorized"])
+    result = await service._resend_qr(user_id, PHONE)
+    assert result is True
+    assert "כבר מחובר" in bot.sent[0][1]
+
+
+async def test_resend_qr_authorized_no_existing_user():
+    """State authorized, user not found by phone → 'already connected' sent."""
+    from echo_v2.ports.whatsapp import ConnectionStatus
+
+    service, bot, user_repo, conn_repo, green_client = _make_service()
+    user_id = await user_repo.create_user(PHONE, onboarding_status="pending")
+    await conn_repo.save(_make_connection(user_id, ConnectionStatus.PROVISIONING, conn_repo))
+
+    del user_repo._users[PHONE]
+    green_client.set_state_sequence(["authorized"])
+    result = await service._resend_qr(user_id, PHONE)
+    assert result is True
+    assert "כבר מחובר" in bot.sent[0][1]
+
+
+# --- _qr_outcome: passkey / timeout ------------------------------------------
+
+
+def test_qr_outcome_passkey_required():
+    """passkeyRequired type → PASSKEY_REQUIRED."""
+    from echo_v2.ports.whatsapp import PairingOutcome
+    from echo_v2.services.onboarding import _qr_outcome
+    assert _qr_outcome({"type": "passkeyRequired"}) is PairingOutcome.PASSKEY_REQUIRED
+
+
+def test_qr_outcome_timeout():
+    """Unknown type → TIMEOUT."""
+    from echo_v2.ports.whatsapp import PairingOutcome
+    from echo_v2.services.onboarding import _qr_outcome
+    assert _qr_outcome({"type": "unknown"}) is PairingOutcome.TIMEOUT

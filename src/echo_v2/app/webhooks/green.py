@@ -1,0 +1,403 @@
+"""Green API webhook ingress route.
+
+Static endpoint::
+
+    POST /webhooks/whatsapp/green
+
+No ``instance_id`` in the path. The payload contains ``instanceData.idInstance``,
+so after authenticating we resolve the connection from that. This is what
+enables create+configure in one partner call (we don't know ``idInstance``
+until ``createInstance`` returns, so we can't construct an instance-specific
+URL beforehand).
+
+Auth (plan guardrail G3): Green sends the per-instance ``webhookUrlToken``
+back in the ``Authorization`` header as ``Bearer <token>`` or
+``Basic <base64(token:)>``. We store ``sha256(token)`` and validate with
+``hmac.compare_digest``. The plaintext is never stored.
+
+Idempotency (plan guardrail G8): providers deliver at-least-once. The route
+deduplicates on ``event.event_id`` -- the provider-assigned identity of a
+*notification*, not of a message. This is critical because one message
+legitimately produces multiple status notifications (``sent`` / ``delivered``
+/ ``read``) sharing the same ``idMessage``, and a connection can revisit an
+earlier state (``blocked`` -> ``starting`` -> ``blocked``). Deduping on
+``event_id`` (which includes the status value for status events and the event
+timestamp for state events) distinguishes distinct notifications while still
+suppressing provider retries of the *same* notification. The
+:class:`WebhookDedupStore` abstraction keeps the route decoupled from the
+storage mechanism; a persistent implementation ships with the persistent
+repository.
+
+Dedup split: ``ProviderMessageEvent`` uses the ``messages`` table
+``INSERT ON CONFLICT DO NOTHING`` as its sole dedup (handled by
+:class:`ChatEventDispatcher` → :class:`ChatIngestionService`). Status and
+state events keep using ``provider_webhook_events`` via ``store.claim``.
+
+The route does **only** ingress + auth + dedupe (for non-message events) +
+dispatch. No business logic.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import logging
+from typing import Any, Protocol, runtime_checkable
+
+from fastapi import APIRouter, Header, HTTPException, Request
+from langsmith import traceable
+
+from echo_v2.app.webhooks.dedup import InMemoryWebhookDedupStore, WebhookDedupStore
+from echo_v2.integrations.green.events import GreenEventAdapter
+from echo_v2.observability.sanitizers import (
+    safe_ingest_green_inputs,
+    safe_ingest_green_output,
+)
+from echo_v2.observability.tracing import tracing_client
+from echo_v2.persistence.state_webhook import StateWebhookRepository
+from echo_v2.persistence.whatsapp_connections import (
+    InMemoryWhatsAppConnectionRepository,
+    WhatsAppConnectionRepository,
+)
+from echo_v2.ports.whatsapp import (
+    ConnectionStatus,
+    ProviderConnectionStateChanged,
+    ProviderEvent,
+    ProviderMessageEvent,
+)
+from echo_v2.services.chat_ingestion import ChatIngestionService
+
+__all__ = [
+    "ChatEventDispatcher",
+    "EventDispatcher",
+    "RecordingEventDispatcher",
+    "build_router",
+    "green_webhook_router",
+]
+
+_logger = logging.getLogger("echo_v2.app.webhooks.green")
+
+
+@runtime_checkable
+class EventDispatcher(Protocol):
+    """Receiver of normalized provider events bound to a user."""
+
+    async def dispatch(
+        self,
+        event: ProviderEvent,
+        *,
+        user_id: str,
+        connection_id: str,
+    ) -> None: ...
+
+    async def dispatch_state_changed(
+        self,
+        event: ProviderConnectionStateChanged,
+        *,
+        user_id: str,
+        connection_id: str,
+        was_connected: bool,
+    ) -> None: ...
+
+
+class RecordingEventDispatcher:
+    """Stub dispatcher for Step 0.
+
+    Records every dispatched event (for tests and future wiring). Handles
+    :class:`ProviderConnectionStateChanged` by updating the connection
+    repository's stored status; other event types are recorded only -- the
+    real ``ConversationService`` is added in Step 2.
+    """
+
+    def __init__(
+        self,
+        connection_repo: WhatsAppConnectionRepository | None = None,
+    ) -> None:
+        self._repo = connection_repo
+        self.dispatched: list[tuple[ProviderEvent, str, str]] = []
+
+    async def dispatch(
+        self,
+        event: ProviderEvent,
+        *,
+        user_id: str,
+        connection_id: str,
+    ) -> None:
+        self.dispatched.append((event, user_id, connection_id))
+        if isinstance(event, ProviderConnectionStateChanged) and self._repo is not None:
+            await self._repo.update_status(
+                event.connection,
+                event.status,
+                event.provider_raw_status,
+            )
+
+    async def dispatch_state_changed(
+        self,
+        event: ProviderConnectionStateChanged,
+        *,
+        user_id: str,
+        connection_id: str,
+        was_connected: bool,
+    ) -> None:
+        """State already updated atomically; just record for tests."""
+        self.dispatched.append((event, user_id, connection_id))
+
+
+class ChatEventDispatcher:
+    """Real dispatcher that routes events to the appropriate handler.
+
+    * ``ProviderMessageEvent`` → :class:`ChatIngestionService` (saves
+      message + updates chat state + manages queue).
+    * ``ProviderConnectionStateChanged`` → connection repo (updates status)
+      + onboarding service (if connected, sends welcome message).
+    * ``ProviderMessageStatusEvent`` → logged only (no action this milestone).
+
+    The ``connection_id`` is the ``whatsapp_connections.id`` UUID (not the
+    provider's ``idInstance``), resolved by the route from the authenticated
+    connection row.
+    """
+
+    def __init__(
+        self,
+        ingestion_service: ChatIngestionService,
+        connection_repo: WhatsAppConnectionRepository,
+        onboarding_service: Any | None = None,
+    ) -> None:
+        self._ingestion = ingestion_service
+        self._connection_repo = connection_repo
+        self._onboarding = onboarding_service
+
+    @traceable(
+        name="wfm.ingest.green",
+        client=tracing_client,
+        process_inputs=safe_ingest_green_inputs,
+        process_outputs=safe_ingest_green_output,
+    )
+    async def dispatch(
+        self,
+        event: ProviderEvent,
+        *,
+        user_id: str,
+        connection_id: str,
+    ) -> None:
+        if isinstance(event, ProviderMessageEvent):
+            await self._ingestion.ingest_message(
+                event,
+                user_id=user_id,
+                connection_id=connection_id,
+            )
+        elif isinstance(event, ProviderConnectionStateChanged):
+            # Transition guard: capture prior state before updating.
+            # Only notify on a genuine CONNECTED → PAIRING_REQUIRED
+            # transition, not on repeated notAuthorized events or
+            # initial provisioning.
+            conn_before = await self._connection_repo.get(event.connection)
+            was_connected = (
+                conn_before is not None
+                and conn_before.status == ConnectionStatus.CONNECTED
+            )
+
+            await self._connection_repo.update_status(
+                event.connection,
+                event.status,
+                event.provider_raw_status,
+            )
+            # If connected and onboarding is wired, complete the onboarding.
+            if (
+                self._onboarding is not None
+                and event.status == ConnectionStatus.CONNECTED
+            ):
+                # Resolve the user's phone from the connection.
+                conn = await self._connection_repo.get(event.connection)
+                if conn is not None:
+                    # The user's phone is stored in the users table;
+                    # the onboarding service resolves by user_id.
+                    await self._onboarding.handle_connection_established_by_id(
+                        user_id,
+                    )
+            elif (
+                self._onboarding is not None
+                and event.status == ConnectionStatus.PAIRING_REQUIRED
+                and was_connected
+            ):
+                await self._onboarding.handle_disconnect_notification(user_id)
+        # ProviderMessageStatusEvent: no action in this milestone
+
+    async def dispatch_state_changed(
+        self,
+        event: ProviderConnectionStateChanged,
+        *,
+        user_id: str,
+        connection_id: str,
+        was_connected: bool,
+    ) -> None:
+        """Onboarding-only dispatch after atomic claim + status update.
+
+        The connection status has already been updated atomically by
+        :class:`StateWebhookRepository.claim_and_update_status`. This
+        method handles the onboarding side effects (welcome message,
+        disconnect notification) using the ``was_connected`` flag
+        captured before the update.
+        """
+        if self._onboarding is None:
+            return
+        if event.status == ConnectionStatus.CONNECTED:
+            conn = await self._connection_repo.get(event.connection)
+            if conn is not None:
+                await self._onboarding.handle_connection_established_by_id(
+                    user_id,
+                )
+        elif (
+            event.status == ConnectionStatus.PAIRING_REQUIRED
+            and was_connected
+        ):
+            await self._onboarding.handle_disconnect_notification(user_id)
+
+
+def _extract_token_from_header(authorization: str | None) -> str | None:
+    """Extract the webhook token from a ``Bearer`` or ``Basic`` header.
+
+    Green may send either form. Returns ``None`` if the header is missing or
+    malformed -- the caller treats that as auth failure.
+    """
+    if not authorization:
+        return None
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2:
+        return None
+    scheme, value = parts[0].lower(), parts[1].strip()
+    if scheme == "bearer":
+        return value
+    if scheme == "basic":
+        try:
+            decoded = base64.b64decode(value, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+        # Green sends ``token:`` (empty password) or ``token:anything``.
+        token = decoded.split(":", 1)[0]
+        return token or None
+    return None
+
+
+def _valid_webhook_token(candidate: str, expected_hash: bytes) -> bool:
+    """Constant-time comparison of ``sha256(candidate)`` to ``expected_hash``."""
+    candidate_hash = hashlib.sha256(candidate.encode("utf-8")).digest()
+    return hmac.compare_digest(candidate_hash, expected_hash)
+
+
+def build_router(
+    *,
+    connection_repo: WhatsAppConnectionRepository,
+    dispatcher: EventDispatcher,
+    adapter: GreenEventAdapter | None = None,
+    dedup_store: WebhookDedupStore | None = None,
+    state_webhook_repo: StateWebhookRepository | None = None,
+) -> APIRouter:
+    """Build a Green webhook router wired to the given dependencies.
+
+    Kept as a factory so tests and the real app can inject fakes/real
+    components. A module-level singleton (``green_webhook_router``) is also
+    exposed for simple mounting, but the factory is the preferred entry point.
+
+    If ``state_webhook_repo`` is supplied, ``ProviderConnectionStateChanged``
+    events use it to claim + update status atomically, then call
+    ``dispatcher.dispatch_state_changed`` for onboarding side effects only.
+    If not supplied, state events fall back to the legacy path
+    (``store.claim`` + ``dispatcher.dispatch``).
+    """
+    router = APIRouter()
+    parse_adapter = adapter or GreenEventAdapter()
+    store = dedup_store or InMemoryWebhookDedupStore()
+
+    @router.post("/webhooks/whatsapp/green")
+    async def green_webhook(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, str]:
+        try:
+            payload = await request.json()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid json") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="invalid payload")
+
+        instance_data = payload.get("instanceData")
+        if (
+            not isinstance(instance_data, dict)
+            or instance_data.get("idInstance") is None
+        ):
+            raise HTTPException(status_code=404, detail="unknown instance")
+
+        instance_id = str(instance_data["idInstance"])
+        stored = await connection_repo.get_by_provider_id("green", instance_id)
+        if stored is None:
+            raise HTTPException(status_code=404, detail="unknown instance")
+
+        candidate = _extract_token_from_header(authorization)
+        if candidate is None or not _valid_webhook_token(
+            candidate, stored.webhook_token_hash
+        ):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+        # stored.id is the DB UUID; required for dispatch/dedup. In-memory
+        # repos may not assign one, but a real webhook always comes from a
+        # persisted connection.
+        if stored.id is None:
+            raise HTTPException(status_code=500, detail="connection has no id")
+
+        event = parse_adapter.parse(payload)
+        if event is None:
+            return {"status": "ignored"}
+
+        # Dedup split:
+        # - Message events: dedup via messages table INSERT ON CONFLICT
+        #   (handled by the dispatcher → ChatIngestionService).
+        # - State events (ProviderConnectionStateChanged): dedup + status
+        #   update atomically via state_webhook_repo (if wired), then
+        #   onboarding-only dispatch.
+        # - Status events: dedup via provider_webhook_events (store.claim).
+        if isinstance(event, ProviderConnectionStateChanged) and state_webhook_repo is not None:
+            result = await state_webhook_repo.claim_and_update_status(
+                event_id=event.event_id,
+                provider="green",
+                connection_id=stored.id,
+                event_type=type(event).__name__,
+                connection_ref=event.connection,
+                status=event.status,
+                raw=event.provider_raw_status,
+            )
+            if not result.claimed:
+                return {"status": "duplicate"}
+            await dispatcher.dispatch_state_changed(
+                event,
+                user_id=stored.user_id,
+                connection_id=stored.id,
+                was_connected=result.was_connected,
+            )
+            return {"status": "received"}
+
+        if not isinstance(event, ProviderMessageEvent) and not await store.claim(
+            event.event_id,
+            provider="green",
+            connection_id=stored.id,
+            event_type=type(event).__name__,
+        ):
+            return {"status": "duplicate"}
+
+        await dispatcher.dispatch(
+            event,
+            user_id=stored.user_id,
+            connection_id=stored.id,
+        )
+        return {"status": "received"}
+
+    return router
+
+
+# Module-level default router for simple mounting. Real deployments should
+# prefer ``build_router`` with explicit dependency injection.
+green_webhook_router = build_router(
+    connection_repo=InMemoryWhatsAppConnectionRepository(),
+    dispatcher=RecordingEventDispatcher(),
+)

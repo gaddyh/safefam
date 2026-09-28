@@ -1,0 +1,741 @@
+"""ChatAnalysisWorker — single-worker poller that processes due chats.
+
+The worker polls :meth:`ChatStateRepository.list_due` once a minute,
+processes each due chat, and commits the result atomically via
+:meth:`AnalysisCommitRepository.commit_if_current`.
+
+Safety properties:
+
+* **Atomic version-checked commit**: The processor runs the LLM and
+  returns a :class:`PreparedAnalysis` without persisting. The
+  :class:`AnalysisCommitRepository` then locks the chat row, checks
+  ``activity_version``, and only commits (insert result + update active +
+  mark processed) if the version is still current. If a new message
+  arrived during processing, nothing is written.
+
+* **Worker crash = reprocess**: No lease or claim_token. If the worker
+  crashes mid-processing, the chat still has ``next_analysis_at`` in
+  the past and ``activity_version > last_processed_version``. After
+  restart, the worker picks it up again. At-least-once processing;
+  result committed at most once (atomic version check).
+
+* **Single worker only**: No ``FOR UPDATE SKIP LOCKED`` on
+  ``list_due`` — it is a plain SELECT. For POC with one worker, this
+  is fine. The atomic commit handles races if a message arrives during
+  processing.
+
+The worker is **not started in production** by default
+(``CHAT_ANALYSIS_ENABLED=false``). It is constructed and tested but
+not wired into the lifespan loop until a real
+:class:`AnalysisProcessor` exists.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Literal, Protocol, runtime_checkable
+
+from langsmith import traceable
+
+from echo_v2.domain.chat import ChatState, Message
+from echo_v2.domain.waiting_for_me import (
+    PreparedAnalysis,
+    WaitingForMeDecision,
+    WaitingForMeResult,
+)
+from echo_v2.observability.tracing import tracing_client
+from echo_v2.persistence.chat_repositories import (
+    AnalysisCommitRepository,
+    ChatStateRepository,
+    MessageRepository,
+)
+from echo_v2.services.media_summarizer import MediaSummarizer
+from echo_v2.services.transcription import Transcriber, handle_direct_audio_download_url
+from echo_v2.services.waiting_for_me_analyzer import WaitingForMeAnalyzer
+
+__all__ = [
+    "AnalysisProcessor",
+    "ChatAnalysisProcessor",
+    "ChatAnalysisWorker",
+    "ConversationInput",
+    "RecordingAnalysisProcessor",
+]
+
+_logger = logging.getLogger("echo_v2.services.chat_analysis_worker")
+
+
+def safe_process_chat_inputs(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize _process_chat inputs for LangSmith trace metadata.
+
+    Removes ``self`` and the full ``ChatState``. Keeps only safe
+    correlation fields: hashed IDs, version.
+    """
+    from echo_v2.observability.privacy import correlation_id
+
+    chat = inputs.get("chat")
+    if chat is None:
+        return {}
+    return {
+        "user_id_hash": correlation_id(chat.user_id),
+        "chat_id_hash": correlation_id(chat.chat_id),
+        "target_version": chat.activity_version,
+    }
+
+
+def safe_process_chat_output(output: str) -> dict[str, Any]:
+    """Sanitize _process_chat output for LangSmith trace metadata."""
+    return {"status": output}
+
+
+@dataclass(frozen=True)
+class ConversationInput:
+    """Stable, serializable representation of a chat slice for analysis.
+
+    Built from the messages loaded by :meth:`MessageRepository.list_for_analysis`.
+    Contains only the fields needed for the LLM prompt — no IDs, no
+    connection metadata.
+    """
+
+    user_id: str
+    chat_id: str
+    target_version: int
+    messages: list[tuple[str, str, datetime]]  # (direction, text, timestamp)
+
+
+@runtime_checkable
+class AnalysisProcessor(Protocol):
+    """Hook for chat analysis.
+
+    The default :class:`RecordingAnalysisProcessor` records calls without
+    doing real analysis. :class:`ChatAnalysisProcessor` loads messages,
+    builds a :class:`ConversationInput`, and calls a
+    :class:`WaitingForMeAnalyzer` to produce a :class:`PreparedAnalysis`.
+
+    The processor does NOT persist — it returns the analysis result and
+    conversation snapshot. The :class:`ChatAnalysisWorker` commits the
+    result atomically via :class:`AnalysisCommitRepository`.
+    """
+
+    async def process(
+        self,
+        user_id: str,
+        chat_id: str,
+        target_version: int,
+    ) -> PreparedAnalysis: ...
+
+
+class RecordingAnalysisProcessor:
+    """Test/development processor that records calls without real analysis.
+
+    Records every call as a ``(user_id, chat_id, target_version)`` tuple.
+    Returns a dummy :class:`PreparedAnalysis` with an ``UNCERTAIN`` decision
+    — safe to use in tests and as a placeholder in production wiring (though
+    the worker is not started by default).
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, int]] = []
+
+    async def process(
+        self,
+        user_id: str,
+        chat_id: str,
+        target_version: int,
+    ) -> PreparedAnalysis:
+        self.calls.append((user_id, chat_id, target_version))
+        return PreparedAnalysis(
+            result=WaitingForMeResult(
+                decision=WaitingForMeDecision.UNCERTAIN,
+                confidence=1.0,
+                reason="Recording processor — no real analysis.",
+                target_version=target_version,
+            ),
+            conversation_snapshot={},
+        )
+
+
+class ChatAnalysisProcessor:
+    """Loads messages, builds conversation input, runs analysis.
+
+    Stage 4: message loading + LLM analysis. The processor loads messages
+    via :meth:`MessageRepository.list_for_analysis`, builds a
+    :class:`ConversationInput`, passes it to a :class:`WaitingForMeAnalyzer`,
+    and returns a :class:`PreparedAnalysis` containing the result and a
+    conversation snapshot for training/feedback.
+
+    The processor does NOT persist. The :class:`ChatAnalysisWorker`
+    commits the result atomically via :class:`AnalysisCommitRepository`,
+    which handles:
+
+    - ``WAITING_FOR_ME`` → upsert active (preserve ``waiting_since`` and
+      ``notified_at`` if a row already exists).
+    - ``NOT_WAITING_FOR_ME`` / ``UNCERTAIN`` → delete active if exists.
+
+    Args:
+        message_repo: The :class:`MessageRepository` for
+            :meth:`list_for_analysis`.
+        analyzer: The :class:`WaitingForMeAnalyzer` that produces the
+            :class:`WaitingForMeResult`.
+        context_messages: Number of messages before the last outbound
+            to include for context. Default 5.
+        max_no_outbound: If no outbound exists, load this many recent
+            messages. Default 20.
+        transcriber: Optional :class:`Transcriber` for lazy audio
+            transcription. When provided, audio messages with
+            ``media_download_url`` are transcribed before analysis and
+            the transcript is persisted via ``message_repo.update_text``.
+            When ``None``, audio messages use ``text=""`` (same as today).
+        media_summarizer: Optional :class:`MediaSummarizer` for lazy
+            summarization of image/video/document messages. When
+            provided, media messages with ``media_download_url`` and no
+            text are summarized before analysis and the summary is
+            persisted via ``message_repo.update_text``. When ``None``,
+            media messages use ``text=""`` (same as today).
+    """
+
+    def __init__(
+        self,
+        message_repo: MessageRepository,
+        analyzer: WaitingForMeAnalyzer,
+        *,
+        context_messages: int = 5,
+        max_no_outbound: int = 20,
+        transcriber: Transcriber | None = None,
+        media_summarizer: MediaSummarizer | None = None,
+    ) -> None:
+        self._messages = message_repo
+        self._analyzer = analyzer
+        self._context_messages = context_messages
+        self._max_no_outbound = max_no_outbound
+        self._transcriber = transcriber
+        self._media_summarizer = media_summarizer
+
+    async def process(
+        self,
+        user_id: str,
+        chat_id: str,
+        target_version: int,
+    ) -> PreparedAnalysis:
+        messages = await self._messages.list_for_analysis(
+            user_id=user_id,
+            chat_id=chat_id,
+            context_messages=self._context_messages,
+            max_no_outbound=self._max_no_outbound,
+        )
+
+        # Lazy media processing: transcribe audio and summarize
+        # image/video/document messages that have a download URL but no
+        # text yet, so the analyzer sees a textual representation.
+        audio_count = sum(1 for m in messages if m.message_type == "audio")
+        audio_with_url = sum(
+            1 for m in messages
+            if m.message_type == "audio" and m.media_download_url is not None
+        )
+        media_count = sum(
+            1 for m in messages if m.message_type in ("image", "video", "document")
+        )
+        media_with_url = sum(
+            1 for m in messages
+            if m.message_type in ("image", "video", "document")
+            and m.media_download_url is not None
+        )
+        _logger.info(
+            "process chat %s/%s version=%d: loaded %d messages, "
+            "transcriber=%s, audio=%d (with_url=%d), "
+            "media_summarizer=%s, media=%d (with_url=%d)",
+            user_id,
+            chat_id,
+            target_version,
+            len(messages),
+            type(self._transcriber).__name__ if self._transcriber else "None",
+            audio_count,
+            audio_with_url,
+            type(self._media_summarizer).__name__ if self._media_summarizer else "None",
+            media_count,
+            media_with_url,
+        )
+        if self._transcriber is not None and audio_with_url > 0:
+            messages = await self._transcribe_audio_messages(messages)
+        if self._media_summarizer is not None and media_with_url > 0:
+            messages = await self._summarize_media_messages(messages)
+        if self._media_summarizer is not None:
+            messages = await self._summarize_link_messages(messages)
+
+        conversation = ConversationInput(
+            user_id=user_id,
+            chat_id=chat_id,
+            target_version=target_version,
+            messages=[
+                (m.direction.value, m.text or "", m.timestamp)
+                for m in messages
+            ],
+        )
+        result = await self._analyzer.analyze(conversation)
+        _logger.info(
+            "analysis for chat %s/%s (version %d): %s (confidence=%s)",
+            user_id,
+            chat_id,
+            target_version,
+            result.decision.value,
+            result.confidence,
+        )
+
+        # Build a conversation snapshot for training/feedback.
+        # This is the exact conversation the model saw — not messages
+        # loaded later when feedback arrives.
+        conversation_snapshot = {
+            "messages": [
+                {
+                    "direction": m.direction.value,
+                    "text": m.text or "",
+                    "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+                }
+                for m in messages
+            ],
+            "target_version": target_version,
+        }
+
+        return PreparedAnalysis(
+            result=result,
+            conversation_snapshot=conversation_snapshot,
+            conversation_input=conversation,
+        )
+
+    async def _transcribe_audio_messages(self, messages: list[Message]) -> list[Message]:
+        """Transcribe audio messages that have a download URL but no text.
+
+        For each message with ``message_type == "audio"``, ``text is None``,
+        and ``media_download_url is not None``: download + convert +
+        transcribe via :func:`handle_direct_audio_download_url`, persist the
+        transcript via :meth:`MessageRepository.update_text`, and replace
+        the message in the returned list.
+
+        On failure: log and leave ``text=None`` (the conversation input
+        will use ``text=""`` for this message, same as today).
+        """
+        result_messages = []
+        for msg in messages:
+            if msg.message_type == "audio":
+                _logger.info(
+                    "audio message %s: text=%s download_url=%s file_name=%s mime=%s",
+                    msg.id,
+                    "set" if msg.text else "None",
+                    "set" if msg.media_download_url else "None",
+                    msg.media_file_name,
+                    msg.media_mime_type,
+                )
+            if (
+                msg.message_type == "audio"
+                and msg.text is None
+                and msg.media_download_url is not None
+            ):
+                _logger.info(
+                    "starting transcription for message %s url=%s",
+                    msg.id,
+                    msg.media_download_url,
+                )
+                try:
+                    if self._transcriber is None:
+                        _logger.warning(
+                            "audio message %s has download URL but no transcriber configured",
+                            msg.id,
+                        )
+                    else:
+                        transcript = await handle_direct_audio_download_url(
+                            transcriber=self._transcriber,
+                            download_url=msg.media_download_url,
+                            file_name=msg.media_file_name or "voice-message",
+                            mime_type=msg.media_mime_type or "",
+                        )
+                        await self._messages.update_text(msg.id, transcript)
+                        _logger.info(
+                            "transcribed audio message %s: %s",
+                            msg.id,
+                            transcript[:100],
+                        )
+                        msg = dataclasses.replace(msg, text=transcript)
+                except Exception:
+                    _logger.exception(
+                        "audio transcription failed for message %s; "
+                        "using text=None",
+                        msg.id,
+                    )
+            result_messages.append(msg)
+        return result_messages
+
+    async def _summarize_media_messages(self, messages: list[Message]) -> list[Message]:
+        """Summarize image/video/document messages with a download URL but no text.
+
+        For each message with ``message_type`` in (image, video, document),
+        ``text is None``, and ``media_download_url is not None``: summarize
+        via :meth:`MediaSummarizer.summarize_media`, persist the summary via
+        :meth:`MessageRepository.update_text`, and replace the message in
+        the returned list. The existing caption (if any) is passed as
+        context to the summarizer.
+
+        On failure: log and leave ``text=None`` (the conversation input
+        will use ``text=""`` for this message, same as today).
+        """
+        result_messages = []
+        for msg in messages:
+            if msg.message_type in ("image", "video", "document"):
+                _logger.info(
+                    "%s message %s: text=%s download_url=%s file_name=%s mime=%s",
+                    msg.message_type,
+                    msg.id,
+                    "set" if msg.text else "None",
+                    "set" if msg.media_download_url else "None",
+                    msg.media_file_name,
+                    msg.media_mime_type,
+                )
+            if (
+                msg.message_type in ("image", "video", "document")
+                and msg.text is None
+                and msg.media_download_url is not None
+            ):
+                _logger.info(
+                    "starting media summarization for message %s type=%s url=%s",
+                    msg.id,
+                    msg.message_type,
+                    msg.media_download_url,
+                )
+                try:
+                    if self._media_summarizer is None:
+                        _logger.warning(
+                            "%s message %s has download URL but no summarizer configured",
+                            msg.message_type,
+                            msg.id,
+                        )
+                    else:
+                        summary = await self._media_summarizer.summarize_media(
+                            download_url=msg.media_download_url,
+                            mime_type=msg.media_mime_type,
+                            file_name=msg.media_file_name,
+                            message_type=msg.message_type,
+                            caption=None,
+                        )
+                        await self._messages.update_text(msg.id, summary.text)
+                        _logger.info(
+                            "summarized %s message %s: %s",
+                            msg.message_type,
+                            msg.id,
+                            summary.text[:100],
+                        )
+                        msg = dataclasses.replace(msg, text=summary.text)
+                except Exception:
+                    _logger.exception(
+                        "media summarization failed for message %s; "
+                        "using text=None",
+                        msg.id,
+                    )
+            result_messages.append(msg)
+        return result_messages
+
+    async def _summarize_link_messages(self, messages: list[Message]) -> list[Message]:
+        """Summarize text messages that are "mostly a link".
+
+        For each text message where :func:`is_link_message` returns True,
+        fetch the URL and replace the message text with a short summary
+        (prefixed with the original URL for context). The summary is
+        persisted via :meth:`MessageRepository.update_text`.
+
+        On failure: log and keep the original text (the URL is still
+        useful to the analyzer even without a summary).
+        """
+        from echo_v2.services.media_summarizer import is_link_message
+
+        result_messages = []
+        for msg in messages:
+            if msg.message_type != "text" or not is_link_message(msg.text):
+                result_messages.append(msg)
+                continue
+            _logger.info(
+                "link message %s: summarizing url in text=%s",
+                msg.id,
+                (msg.text or "")[:80],
+            )
+            try:
+                if self._media_summarizer is None:
+                    result_messages.append(msg)
+                    continue
+                from echo_v2.services.media_summarizer import extract_urls
+
+                urls = extract_urls(msg.text or "")
+                if not urls:
+                    result_messages.append(msg)
+                    continue
+                summary = await self._media_summarizer.summarize_link(urls[0])
+                # Keep the original URL visible alongside the summary so the
+                # analyzer can still see what was shared.
+                if summary.text:
+                    new_text = f"{urls[0]} — {summary.text}"
+                else:
+                    new_text = msg.text or urls[0]
+                await self._messages.update_text(msg.id, new_text)
+                _logger.info(
+                    "summarized link message %s: %s",
+                    msg.id,
+                    summary.text[:100],
+                )
+                msg = dataclasses.replace(msg, text=new_text)
+            except Exception:
+                _logger.exception(
+                    "link summarization failed for message %s; "
+                    "keeping original text",
+                    msg.id,
+                )
+            result_messages.append(msg)
+        return result_messages
+
+
+class ChatAnalysisWorker:
+    """Single-worker poller that processes due chats.
+
+    Args:
+        chat_state_repo: The repository for ``list_due`` and ``get``.
+        processor: The :class:`AnalysisProcessor` that analyzes each chat
+            and returns a :class:`PreparedAnalysis` (no persistence).
+        commit_repo: The :class:`AnalysisCommitRepository` that atomically
+            commits the analysis if the chat version is still current.
+        poll_interval_seconds: How often ``run_loop`` polls for due chats.
+            Default 60 seconds.
+        excluded_chat_ids: Chat IDs to never analyze (e.g. the Echo bot's
+            own service chat). Due rows for these chats are drained via
+            ``mark_processed`` so they don't reappear every poll, but no
+            analysis is run. Defaults to empty.
+    """
+
+    def __init__(
+        self,
+        chat_state_repo: ChatStateRepository,
+        processor: AnalysisProcessor,
+        commit_repo: AnalysisCommitRepository,
+        *,
+        poll_interval_seconds: float = 60.0,
+        judge: Any | None = None,
+        excluded_chat_ids: frozenset[str] = frozenset(),
+    ) -> None:
+        self._chat_state_repo = chat_state_repo
+        self._processor = processor
+        self._commit_repo = commit_repo
+        self._poll_interval = poll_interval_seconds
+        self._judge = judge
+        self._excluded_chat_ids = excluded_chat_ids
+
+    async def run_once(self, *, limit: int = 20) -> bool:
+        """Process all due chats once.
+
+        Returns ``True`` if at least one due chat was touched (processed or
+        drained). A processor exception on one chat does not flip the
+        return to ``False`` — the chat was still seen and attempted.
+        """
+        now = datetime.now(timezone.utc)
+        due_chats = await self._chat_state_repo.list_due(now, limit=limit)
+        processed_any = False
+        for chat in due_chats:
+            # Drain excluded service chats (e.g. the Echo bot's own chat)
+            # without analyzing them. mark_processed is version-fenced, so
+            # a new message arriving between list_due and mark_processed
+            # won't get wrongly marked as processed.
+            if chat.chat_id in self._excluded_chat_ids:
+                try:
+                    await self._chat_state_repo.mark_processed(
+                        chat.user_id, chat.chat_id, chat.activity_version
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    _logger.exception(
+                        "error draining excluded chat %s/%s, continuing",
+                        chat.user_id,
+                        chat.chat_id,
+                    )
+                processed_any = True
+                continue
+            try:
+                await self._process_chat(chat)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _logger.exception(
+                    "error processing chat %s/%s, continuing",
+                    chat.user_id,
+                    chat.chat_id,
+                )
+            # The chat was seen/attempted even if processing raised.
+            processed_any = True
+        return processed_any
+
+    async def run_loop(self) -> None:
+        """Poll for due chats until cancelled.
+
+        On each iteration, calls ``run_once``. If nothing was due, sleeps
+        for ``poll_interval_seconds``. Handles ``CancelledError`` cleanly.
+        """
+        while True:
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                _logger.info("chat analysis worker loop cancelled")
+                raise
+            except Exception:
+                # An unexpected error in the loop should not kill the
+                # worker — log and continue after a pause.
+                _logger.exception("chat analysis worker loop error, continuing")
+            try:
+                await asyncio.sleep(self._poll_interval)
+            except asyncio.CancelledError:
+                _logger.info("chat analysis worker loop cancelled during sleep")
+                raise
+
+    @traceable(
+        name="wfm.analysis",
+        client=tracing_client,
+        process_inputs=safe_process_chat_inputs,
+        process_outputs=safe_process_chat_output,
+    )
+    async def _process_chat(
+        self,
+        chat: ChatState,
+    ) -> Literal["committed", "stale", "missing"]:
+        """Process a single due chat with atomic version-checked commit.
+
+        1. Call the processor (outside any transaction — no lock held).
+           The processor runs the LLM and returns a
+           :class:`PreparedAnalysis` without persisting.
+        2. Call :meth:`AnalysisCommitRepository.commit_if_current`, which
+           locks the chat row, checks the version, and commits the result
+           + active state + mark_processed in one transaction.
+
+        Returns ``"committed"`` if the result was persisted, ``"stale"``
+        if the version changed during processing (nothing written), or
+        ``"missing"`` if the chat disappeared during processing.
+        """
+        version_being_processed = chat.activity_version
+
+        # Add user/chat metadata to the trace for dashboard grouping (cost per user).
+        from langsmith.run_helpers import get_current_run_tree
+
+        from echo_v2.observability.privacy import correlation_id
+
+        run_tree = get_current_run_tree()
+        if run_tree is not None:
+            run_tree.add_metadata({
+                "user_id_hash": correlation_id(str(chat.user_id)),
+                "chat_id_hash": correlation_id(str(chat.chat_id)),
+            })
+
+        # Process (outside any transaction — no lock held)
+        prepared = await self._processor.process(
+            chat.user_id,
+            chat.chat_id,
+            version_being_processed,
+        )
+
+        # Atomic commit: lock, version check, insert, upsert, mark processed.
+        outcome = await self._commit_repo.commit_if_current(
+            user_id=chat.user_id,
+            chat_id=chat.chat_id,
+            target_version=version_being_processed,
+            analysis=prepared,
+        )
+
+        if outcome.status == "committed":
+            _logger.info(
+                "committed analysis for chat %s/%s (version %d, result_id=%s)",
+                chat.user_id,
+                chat.chat_id,
+                version_being_processed,
+                outcome.result_id,
+            )
+            # Run the LLM judge and store score as LangSmith feedback.
+            if self._judge is not None and prepared.conversation_input is not None:
+                await self._run_judge(prepared)
+        elif outcome.status == "stale":
+            _logger.info(
+                "chat %s/%s version changed during processing (%d), "
+                "discarding result",
+                chat.user_id,
+                chat.chat_id,
+                version_being_processed,
+            )
+        else:  # missing
+            _logger.warning(
+                "chat %s/%s disappeared during processing, discarding result",
+                chat.user_id,
+                chat.chat_id,
+            )
+
+        return outcome.status
+
+    async def _run_judge(self, prepared: PreparedAnalysis) -> None:
+        """Run the LLM judge and store the score as LangSmith feedback."""
+        if prepared.conversation_input is None:
+            return
+        try:
+            judge_result = await self._judge.judge(  # type: ignore[union-attr]
+                conversation=prepared.conversation_input,
+                result=prepared.result,
+            )
+            # Attach the score as feedback to the current wfm.analysis run.
+            from langsmith.run_helpers import get_current_run_tree
+
+            run_tree = get_current_run_tree()
+            session_id = os.environ.get("LANGSMITH_PROJECT_ID", "")
+            if run_tree is not None:
+                tracing_client.create_feedback(
+                    run_id=str(run_tree.id),
+                    key="judge_correctness",
+                    score=judge_result.score,
+                    comment=judge_result.explanation,
+                    session_id=session_id or None,
+                )
+            # Flywheel: send disagreements (0.0) and ambiguous cases (0.5)
+            # to the annotation queue for human review. We add the wfm.judge
+            # run (not wfm.analysis) because the judge trace has the full
+            # conversation and result as inputs — visible to the reviewer.
+            queue_id = os.environ.get("JUDGE_ANNOTATION_QUEUE_ID", "")
+            if queue_id and judge_result.score <= 0.5 and judge_result.run_id:
+                try:
+                    # Flush tracing client so the judge run is persisted to the
+                    # server before we try to add it to the annotation queue.
+                    tracing_client.flush()
+                    # Use the new annotation-queues items API (POST /items)
+                    # instead of the deprecated runs/by-key endpoint.
+                    # Each item needs run_id, session_id (project UUID), and
+                    # start_time for the SmithDB-backed lookup.
+                    await tracing_client.annotation_queues.items.create(
+                        queue_id=queue_id,
+                        items=[
+                            {
+                                "item_type": "RUN",
+                                "run_id": judge_result.run_id,
+                                "session_id": session_id,
+                                "start_time": judge_result.run_start_time or "",
+                            }
+                        ],
+                    )
+                    _logger.info(
+                        "judge score=%.1f → added judge run %s to annotation queue %s",
+                        judge_result.score,
+                        judge_result.run_id,
+                        queue_id,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "failed to add run to annotation queue %s",
+                        queue_id,
+                        exc_info=True,
+                    )
+            _logger.info(
+                "judge score=%.1f: %s",
+                judge_result.score,
+                judge_result.explanation,
+            )
+        except Exception:
+            _logger.exception("judge evaluation failed")
